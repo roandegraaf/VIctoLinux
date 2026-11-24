@@ -1183,7 +1183,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -1192,6 +1192,8 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    // The refreshes just done counted their own time.
+                    started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1216,6 +1218,7 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        started = std::time::Instant::now();
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
