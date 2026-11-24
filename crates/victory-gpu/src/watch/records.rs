@@ -58,16 +58,30 @@ fn holding<T: Copy>(
     (at - base < len(entry)).then_some((base, entry))
 }
 
+/// Removes the entries of `map` with bytes in `[start, end)`: the one
+/// holding `start` and those starting inside (entries do not overlap, and
+/// there may be one view per 64 KiB page, so not a pass over all).
+fn remove<T: Copy>(
+    map: &mut BTreeMap<usize, T>,
+    start: usize,
+    end: usize,
+    len: impl Fn(T) -> usize,
+) {
+    let first = holding(map, start, len).map(|(base, _)| base);
+    let inside: Vec<usize> = map.range(start..end).map(|(&base, _)| base).collect();
+    for base in first.into_iter().chain(inside) {
+        map.remove(&base);
+    }
+}
+
 /// The runtime reserved title memory `[base, base + len)` (`len` as the
 /// host rounds it, to its 4 KiB pages). Whatever was recorded there is gone.
 pub fn title_memory_allocated(base: usize, len: usize, kind: TitleMemory) {
     let end = base.saturating_add(len);
     {
         let mut r = records();
-        r.reserved
-            .retain(|&b, &mut (l, _)| b >= end || b.saturating_add(l) <= base);
-        r.views
-            .retain(|&b, &mut l| b >= end || b.saturating_add(l) <= base);
+        remove(&mut r.reserved, base, end, |(len, _)| len);
+        remove(&mut r.views, base, end, |len| len);
         r.reserved.insert(base, (len, kind));
     }
     // What a walk found there before describes older memory.
@@ -78,8 +92,7 @@ pub fn title_memory_allocated(base: usize, len: usize, kind: TitleMemory) {
 pub fn title_memory_freed(base: usize) {
     let mut r = records();
     if let Some((len, _)) = r.reserved.remove(&base) {
-        r.views
-            .retain(|&b, _| b < base || b >= base.saturating_add(len));
+        remove(&mut r.views, base, base.saturating_add(len), |len| len);
     }
 }
 
@@ -169,6 +182,14 @@ mod tests {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// Held by each test here: one frees memory the records still hold
+    /// (as the title does), and another given that address would record it.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    fn alone() -> std::sync::MutexGuard<'static, ()> {
+        ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `VirtualQuery` calls of lookups on this thread since the last call.
     fn queries() -> usize {
         QUERIES.take()
@@ -210,6 +231,7 @@ mod tests {
     /// pools: watched, committed in parts.
     #[test]
     fn a_watched_reservation_is_answered_whole() {
+        let _alone = alone();
         let p = reserve(6 * PAGE, MEM_RESERVE | MEM_WRITE_WATCH);
         for block in [0, 2, 4] {
             let at = (p + block * PAGE) as *const _;
@@ -244,6 +266,7 @@ mod tests {
     /// block to remember, as the walk finds, without the walk.
     #[test]
     fn a_reservation_under_a_block_has_no_region() {
+        let _alone = alone();
         let p = reserve(4096, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH);
         title_memory_allocated(p, 4096, TitleMemory::Watched);
         assert_eq!(recorded(p), None);
@@ -255,6 +278,7 @@ mod tests {
     /// the record goes when the host refuses the asking it leads to.
     #[test]
     fn a_reservation_freed_unseen_is_forgotten() {
+        let _alone = alone();
         let p = reserve(4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH);
         title_memory_allocated(p, 4 * PAGE, TitleMemory::Watched);
         assert!(recorded(p).is_some());
@@ -289,6 +313,7 @@ mod tests {
     /// at once.
     #[test]
     fn a_freed_reservation_is_not_answered() {
+        let _alone = alone();
         let p = reserve(2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH);
         title_memory_allocated(p, 2 * PAGE, TitleMemory::Watched);
         assert!(recorded(p + PAGE).is_some());
@@ -398,6 +423,7 @@ mod tests {
 
     #[test]
     fn views_in_a_placeholder_are_answered_one_by_one() {
+        let _alone = alone();
         let pages = Placeholder::new(6);
         pages.map(1, 1);
         pages.map(2, 1);
@@ -447,10 +473,47 @@ mod tests {
         pages.unmap(5, 1);
     }
 
+    /// A reservation over older records replaces all it overlaps, views
+    /// too, and no other.
+    #[test]
+    fn a_reservation_replaces_the_records_it_overlaps() {
+        let _alone = alone();
+        // Addresses no host allocation has (the top of the address space).
+        let at = |block: usize| (usize::MAX / PAGE - 64 + block) * PAGE;
+        title_memory_allocated(at(0), 2 * PAGE, TitleMemory::Plain);
+        title_memory_allocated(at(2), 4 * PAGE, TitleMemory::Views);
+        title_memory_allocated(at(8), PAGE, TitleMemory::Watched);
+        for block in [1, 3, 5] {
+            records().views.insert(at(block), PAGE);
+        }
+        // Over the end of the first, a view at its start and one inside.
+        title_memory_allocated(at(1) + 4096, 3 * PAGE, TitleMemory::Watched);
+        let new = Some((at(1) + 4096, 3 * PAGE, Some(TitleMemory::Watched)));
+        assert_eq!(title_memory_record(at(0)), None);
+        assert_eq!(title_memory_record(at(1)), None);
+        assert_eq!(title_memory_record(at(1) + 4096), new);
+        assert_eq!(title_memory_record(at(4)), new);
+        assert_eq!(
+            title_memory_record(at(4) + 4096),
+            None,
+            "the placeholder went too"
+        );
+        assert_eq!(title_memory_record(at(5)), Some((at(5), PAGE, None)));
+        assert_eq!(
+            title_memory_record(at(8)),
+            Some((at(8), PAGE, Some(TitleMemory::Watched)))
+        );
+        title_memory_freed(at(1) + 4096);
+        title_memory_freed(at(8));
+        records().views.remove(&at(5));
+        assert_eq!(title_memory_record(at(5)), None);
+    }
+
     /// Memory the runtime was not asked for (the title's own
     /// `VirtualAlloc`): walked once, then remembered until a remap there.
     #[test]
     fn unrecorded_memory_is_walked_and_remembered() {
+        let _alone = alone();
         let p = reserve(3 * PAGE, MEM_RESERVE | MEM_COMMIT);
         let other = reserve(PAGE, MEM_RESERVE | MEM_COMMIT);
         assert_eq!(find(p), None);
