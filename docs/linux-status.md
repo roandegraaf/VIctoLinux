@@ -42,95 +42,128 @@ With `--execute` (two runs, no crash in either, no `crashes.log`):
 | Boot, first-boot screen ("press A") | 30 fps, 33 ms/frame; waits for input |
 | First-boot and start screens, intro | 22–30 fps; `--auto-enter` gets through them unattended |
 | Loading into the world | reached ~85 s after start; loading artwork draws correctly |
-| The world (first mission's opening cutscene) | runs, **0.1–1.5 fps** (mean 3.8 s/frame); the screen is black, with the cutscene's audio in snippets (dark scene as on Windows) |
-| End | stopped by us after ~5 min in the world (run 1: cap at 5 min, during loading) |
+| The world (first mission's opening cutscene) | runs at **0.1–1.5 fps** (log); mean 4.0 s/frame. The screen stays black, with snippets of the cutscene's audio (the scene is dark on Windows too) |
+| End | run 1: our 5-minute cap, during the load. Run 2: we stopped it at 400 s, ~5 min into the world. No crash, no `crashes.log`, no amdgpu fault or ring reset in the kernel log |
+
+The fps come from two sources. The window caption (`VIctory N fps …`,
+sampled every 5 s) gave the menu and load figures. The diag build's
+statistics lines gave the world figures.
 
 Memory: about 13.8 GB for the process in the world. 452 shaders did not
 translate (their draws are dropped; known on Windows too).
 
 ## Frame time in the world
 
-From the diag build's 5-second statistics lines, 46 samples over 5 min 15 s
-in the world (mean per frame; one run, a cutscene not driven identically
-each time, so indicative):
+These figures come from the diag build's statistics lines in run 2: 39 lines
+over 5 min in the world, after loading. Each line covers one window of at
+least 1 s, logged at most every 5 s. They are means of those windows' per-frame
+values. This is one run of a cutscene, so treat the numbers as indicative.
 
 | | ms/frame | share |
 |---|---:|---:|
-| **Whole frame** | **3,795** (median 3,367; 683–10,200) | 100 % |
-| Preparing submissions: copies of title memory (263 MB) | 2,736 | 72 % |
-| Preparing submissions: textures (detile, hash) | 273 | 7 % |
-| Preparing submissions: rest | 147 | 4 % |
-| Copying back (GPU-written ranges to title memory) | 220 | 6 % |
-| Waiting for the GPU | 106 (median 65; max 313) | 3 % |
-| Everything else (title CPU, waits, present) | 313 | 8 % |
+| **Whole frame** | **4,016** (median 3,733; 683–10,200) | 100 % |
+| Preparing submissions: copies of title memory (273 MB) | 2,910 | 72 % |
+| Preparing submissions: textures (detile, hash) | 282 | 7 % |
+| Preparing submissions: rest | 173 | 4 % |
+| Copying back (GPU-written ranges to title memory) | 217 | 5 % |
+| Waiting for the GPU | 112 (median 65; max 313) | 3 % |
+| Everything else (title CPU, waits, present) | 321 | 8 % |
 
-2,169 draws/frame were submitted and 1,476 dropped (no host pipeline), so
-the GPU figure is a lower bound for a complete frame.
+The table counts 2,360 draws/frame submitted and 1,538 dropped (no host
+pipeline). The GPU figure is therefore a lower bound for a complete frame.
 
-The copy statistics (`copystat`) show what the copies are made of, per frame:
+### Inside the copies
 
-- 263 MB copied in 2.7 s: about 96 MB/s. That is per-call and per-page cost,
-  not memory bandwidth (a plain `memcpy` does that in under 30 ms).
-- 7.4 GB of watched title memory checked, 97 % of it unchanged; 122 ms in
-  write-watch queries.
-- 687 copies falling back after meeting an unmapped page, 233 guard faults
-  on view memory, 46 ms in moves.
+The copy statistics (`copystat`, the same 39 windows, per frame):
 
-## Where the time goes: GPU, VIctory's copies, Wine
+- **About 8,500 copies and 11,300 refreshes per frame.** A refresh's "MB"
+  in the log is the size of the range asked for (10 GB/frame), not bytes
+  moved. A refresh copies only the pages the write watch reports as
+  changed, and those bytes are part of the 273 MB. `host.rs` (`Batch::flush`,
+  `shadow.update`) confirms it.
+- **The timed parts add up to under 0.3 s of the 2.9 s:**
+
+  | Part | ms/frame |
+  |---|---:|
+  | `ReadProcessMemory` calls (`moves`) | 60 |
+  | Refreshes of the ten biggest ranges | 40 |
+  | Write-watch queries | 161 |
+
+  The other **~2.6 s is not attributed** by any counter.
+- **The likely candidates are not timed separately.** By the code, they are
+  the parts of `copy_mapped` around the timed read:
+  - `texture::committed`, a `VirtualQuery` on title destinations;
+  - `watch::writing`;
+  - the **995 fallbacks per frame**: a copy that meets an unmapped page
+    re-reads its range in 64 KiB and then 4 KiB pieces, and every failed
+    piece is a failed `ReadProcessMemory`.
+
+  Separately, the title takes 311 guard faults per frame on view memory.
+  Under Wine every one of these goes through a signal handler or Wine's
+  virtual-memory lock. That is a hypothesis to test, not a measurement.
+- **Ten title memory pages are checked per byte that has changed.** Of the
+  10.1 GB of watched memory checked per frame, 97.5 % is unchanged.
+
+A run with `VICTORY_COPY_MODE=plain` (copies as a plain `memcpy`) was
+meant to measure the whole copy path at once. It cannot: the plain copy
+read a reserved, never-committed title page as the world began loading, and
+the process ended (run 3, about 95 s in). The unmapped-page handling is
+needed, so its cost has to be measured, not switched off.
+
+## Splitting the frame: GPU, VIctory's copies, Wine
 
 The table already separates the GPU (3 %) from VIctory's CPU-side work
-(~90 %). What it cannot say is how much of the copies is Wine's doing. The
-copy path calls `GetWriteWatch`, takes guard-page and access faults, and
-falls back on `VirtualQuery`/SEH. All three are cheap on Windows and
-emulated by Wine (a signal handler or a wineserver round-trip, under Wine's
-virtual-memory lock). Proposed measurements, cheapest first:
+(about 90 %). Two things are still open. Which part of the copy path takes
+the unattributed 2.6 s? How much of that is Wine's emulation of cheap Windows
+calls rather than VIctory's own work? Proposed measurements, in order:
 
-1. **Switches that already exist, same build and same scene.**
-   `VICTORY_COPY_MODE=plain` (copies without the mapped-page guard) and
-   `VICTORY_COPY_MODE=none` (no copies; the image is wrong, the timing of
-   everything else is right). `none` minus normal is the total copy cost.
-   `plain` minus normal is the guard and fault cost, which is where Wine's
-   fault delivery shows.
-2. **A profile of the process.** `perf record -g --call-graph dwarf` on the
-   `victory.exe` process and `wineserver` for 60 s in the world, then group
-   samples by module: Wine's `ntdll.so`/`win32u.so`/wineserver and the
-   kernel's fault and signal paths count as Wine overhead, `victory.exe` as
-   ours, `libvulkan_radeon`/vkd3d-proton as the GPU driver path. This gives
-   the Wine share directly.
-3. **Micro-benchmarks on both OSes.** Time the three primitives the copies
-   use in a loop: `GetWriteWatch` on 256 MB, a guard-page fault round-trip,
-   and a 64 KiB `MapViewOfFile3`. Do it on Windows and under this Proton on
-   the same machine. #844 measured `GetWriteWatch` at ~180 µs per call in the
-   world under Wine; #834 measured 54,051 one-page views at 5–18 s under Wine.
-4. **The same save and scene on Windows**, if a Windows install is available
-   on this machine: the per-category times side by side give the Wine factor
-   per category without any modelling.
+1. **A profile of the process in the world**, first because it answers both
+   questions at once and needs no code change:
+   - Run `perf record -g --call-graph dwarf` for 60 s on the `victory.exe`
+     process and on `wineserver`.
+   - Group the samples. Wine's `ntdll.so`/`win32u.so`, wineserver and the
+     kernel's fault, signal and `process_vm_*` paths count as Wine.
+     `victory.exe` counts as VIctory. RADV and vkd3d-proton count as the
+     driver.
+   - Within `victory.exe`, the samples under `copy_mapped` show which of
+     `committed`, `writing` and the fallback walk dominates.
+2. **Timers for the untimed parts**, diagnostics only:
+   - add `copystat` counters for the time in `texture::committed`,
+     `watch::writing` and the fallback walk;
+   - count the pieces the fallback walk reads.
+
+   Those counters then work identically on Windows, which turns the next
+   step into a like-for-like comparison.
+3. **The same scene on Windows** on this machine, if a Windows install is
+   available. Compare the copy counters category by category; the ratio is
+   Wine's factor per category.
+4. **Micro-benchmarks, Windows against this Proton**, in a loop:
+   `ReadProcessMemory` of own memory, including a range that hits an
+   unmapped page; `VirtualQuery` in a big reserved pool; a guard-page fault
+   round-trip; `GetWriteWatch` on 256 MB.
 
 ## What should go native first
 
-**Not the renderer.** The GPU takes 3 % of the frame, and vkd3d-proton is
-not on the critical path. A Vulkan backend would gain nothing measurable
-today, so it stays out of scope until the copies are fixed.
+**Not the renderer.** The GPU takes 3 % of the frame and vkd3d-proton is not
+on the critical path. A Vulkan backend would gain nothing measurable today.
 
-The candidate is **dirty-page tracking of title memory**, if steps 1–2 show
-that the guard, fault and write-watch share of the 2.7 s is large. Under Wine
-every one of those operations is a signal or a wineserver call. Linux can
-answer "which pages of this range were written" in one syscall, with no
-faults: the `PAGEMAP_SCAN` ioctl with `PM_SCAN_WP_MATCHING` (Linux 6.7+),
-or userfaultfd's asynchronous write-protect mode. That can be done without
-a port: a small Wine unixlib (a PE DLL with a Unix side, loaded only under
-Wine) behind the same interface as `watch.rs`'s Windows calls. The rest of
-VIctory stays the Windows build.
+**Nothing yet.** The measurements so far say "the copy path", not which
+call in it, and the obvious candidate doesn't fit. Replacing write watching
+(`GetWriteWatch`) with a Linux mechanism (the `PAGEMAP_SCAN` ioctl or
+userfaultfd write-protect, via a small Wine unixlib) could save at most the
+161 ms the counters see. That is unless its cost lands on the title's
+threads as faults, which only the profile can show.
 
-Before any native code, two VIctory-side reductions apply on Windows too and
-are cheaper:
+The order instead:
 
-- **Check less.** 97 % of the 7.4 GB checked per frame is unchanged.
-  Coarser ranges for memory the title rarely writes would cut the checks.
-  So would trusting the journal for longer.
-- **Look at the fallbacks.** The 687 copies per frame meeting unmapped
-  pages each take an exception-and-retry path. Under Wine, an exception
-  costs several µs and more.
+1. Profile (step 1 above).
+2. If the fallback walk dominates, the fix is in VIctory and helps Windows
+   too. Remember which ranges contain unmapped pages, and skip them
+   per page, instead of failing a whole read and retrying in pieces.
+3. If `VirtualQuery` or the fault path dominates under Wine only, that call
+   is the first candidate for a native path. It would be a Wine unixlib that
+   answers "is this range committed" and "which pages changed" from
+   `/proc/self/pagemap` or `PAGEMAP_SCAN`, with no signals. Everything else
+   stays the Windows build.
 
-Re-measure after each step with the statistics lines above. Make the next
-change only where the numbers move.
+Re-measure after each change with the statistics lines above.

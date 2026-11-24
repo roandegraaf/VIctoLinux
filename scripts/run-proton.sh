@@ -160,14 +160,14 @@ if [[ -n "$dlls" ]]; then
     for f in d3d12.dll d3d12core.dll dxgi.dll; do
         [[ -f "$dlls/$f" ]] || die "$dlls has no $f"
         cmp -s "$dlls/$f" "$WINEPREFIX/drive_c/windows/system32/$f" ||
-            cp "$dlls/$f" "$WINEPREFIX/drive_c/windows/system32/$f"
+            cp --remove-destination "$dlls/$f" "$WINEPREFIX/drive_c/windows/system32/$f"
     done
 elif [[ -n "$proton_dir" ]]; then
     # Put the Proton build's own back, in case another run replaced them.
     for f in d3d12.dll d3d12core.dll; do
-        cp "$proton_dir/files/lib/wine/vkd3d-proton/x86_64-windows/$f" "$WINEPREFIX/drive_c/windows/system32/$f"
+        cp --remove-destination "$proton_dir/files/lib/wine/vkd3d-proton/x86_64-windows/$f" "$WINEPREFIX/drive_c/windows/system32/$f"
     done
-    cp "$proton_dir/files/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$WINEPREFIX/drive_c/windows/system32/dxgi.dll"
+    cp --remove-destination "$proton_dir/files/lib/wine/dxvk/x86_64-windows/dxgi.dll" "$WINEPREFIX/drive_c/windows/system32/dxgi.dll"
 fi
 
 export WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n;d3dcompiler_47=$D3DCOMPILER${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
