@@ -372,3 +372,31 @@ given back for our own use, MB served from the owning copy, blocks dropped
 and lost, MB not taken (unwatched, resting, written by the title), MB owned
 now, and the census: MB ever GPU-owned and how much of it the CPU ever
 touched.
+
+## Allocation lookups and lazy copy-back: measured (2026-11-24)
+
+Same setup, build `5e76c97`, two runs of 7 minutes, `--auto-enter`. Means over
+the world's statistics lines, first four after loading skipped:
+
+| Per frame | lazy copy-back off (default) | `VICTORY_LAZY_COPY_BACK=1` |
+|---|---:|---:|
+| Whole frame (median) | **1,998 ms (1,734)** | 2,816 ms (1,934) |
+| Copies | 298 ms, 38 MB | 508 ms, 40 MB |
+| Allocation lookups | 1,449, 1,429 from records, 10 ms | 529, 23 ms |
+| Copy-back | 221 ms | 272 ms |
+| Textures | 397 ms | 523 ms |
+| GPU | 82 ms | 90 ms |
+| Everything else | 677 ms | 1,353 ms |
+
+From 4.0 s per frame at the start of the day: the holes cache took the copies
+from 2.9 s to 1.2 s. Answering allocation lookups from xmem's records took
+their `VirtualQuery` walks from ~400 ms to 10 ms, and the copies to 0.3 s.
+
+Lazy copy-back works in the world: no crash, same progress, ~200 MB of
+copy-back comparison avoided per frame. Its census confirms the split: **the
+CPU touched 2 % of the memory the GPU wrote** (4.5 of 231 MB). But it gains
+nothing yet, because ~500 MB per frame of GPU-written memory is xmem's
+physical-page views. Lazy copy-back leaves those alone, since they can be
+mapped at several addresses. It stays off by default. The next step for the
+split is those views: GPU-owned views (protecting every alias), or moving
+physical pages into an arena VIctory allocates (see "Unified memory").
