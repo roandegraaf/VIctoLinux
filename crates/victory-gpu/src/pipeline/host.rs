@@ -330,6 +330,9 @@ impl HostPipeline {
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        // Root SRVs are bound as one-view tables (see below); their ranges
+        // must outlive the serialisation, so each is boxed here.
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
@@ -369,6 +372,36 @@ impl HostPipeline {
             ] {
                 for &slot in slots {
                     out.push((slot, params.len() as u32));
+                    // A root SRV is a raw address the GPU reads without
+                    // bounds: the console's reads past the title buffer
+                    // land in other title memory, ours past its host copy
+                    // in unmapped memory (a GPU page fault and a lost
+                    // device in the world). A table of one raw view sized
+                    // to the copy reads zeros there instead; the shader's
+                    // binding (`t<slot>`, a ByteAddressBuffer) is the same.
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV {
+                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                            NumDescriptors: 1,
+                            BaseShaderRegister: u32::from(slot),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                            OffsetInDescriptorsFromTableStart: 0,
+                        }));
+                        let range: &D3D12_DESCRIPTOR_RANGE1 = ranges.last().expect("just pushed");
+                        params.push(D3D12_ROOT_PARAMETER1 {
+                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                                    NumDescriptorRanges: 1,
+                                    pDescriptorRanges: range,
+                                },
+                            },
+                            ShaderVisibility: visibility,
+                        });
+                        continue;
+                    }
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
                         Anonymous: D3D12_ROOT_PARAMETER1_0 {
