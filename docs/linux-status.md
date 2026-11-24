@@ -338,11 +338,16 @@ Known gaps:
   block failed that way once in four runs under Proton before the next
   point.
 - **Under Wine** the bytes land first: the Linux kernel's file of the
-  process's memory (`/proc/<pid>/mem`) writes closed pages. Wine's server
-  opens files, so `/proc/self` is the server; our own process is found
-  once: `/proc` is listed and each process's file the server may open is
-  opened for reading and read at the address of a marked page of ours
-  (16 bytes); only ours is then opened for writing. If the kernel or the container refuses
+  process's memory (`/proc/<pid>/mem`) writes closed pages.
+  `WriteProcessMemory` does not (Wine's server writes with
+  `process_vm_writev`, which keeps to the protection: error 998, measured
+  with the pseudo handle and a real one). Wine's server opens files, so
+  `/proc/self` is the server; our own process number is found once from
+  public data only: a thread of ours takes a random name, which Wine gives
+  the Linux thread, and the process with a thread of that name
+  (`/proc/<pid>/task/<tid>/comm`) is ours. Only our own memory file is
+  opened. The 8-thread test (63 blocks a run) passed 20 runs of 20.
+  If the kernel or the container refuses
   (`proc_mem.force_override`, ptrace limits) the Windows order is used; the
   log says which ("title memory through the kernel's file of it").
 - Other host calls that hand title memory to the kernel (sockets,
