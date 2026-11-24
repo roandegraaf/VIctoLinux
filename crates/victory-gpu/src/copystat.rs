@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// Counters since the last line.
 pub(crate) enum C {
     Submissions,
+    /// Copies into title memory (the title's buffer copies).
     Copies,
     CopyBytes,
     Refreshes,
@@ -37,8 +38,32 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// Copies of title memory into a list's upload memory.
+    Fills,
+    FillBytes,
+    /// Reads that failed, and the time in the piece-by-piece walk after
+    /// one.
+    FailedReads,
+    FallbackUs,
+    /// Of copies into title memory: the time asking whether the destination
+    /// is committed, and opening its guarded blocks.
+    CommittedUs,
+    WritingUs,
+    /// Under Wine: allocation lookups, those that walked the allocation's
+    /// regions, and the time in both.
+    Allocations,
+    RegionWalks,
+    AllocationUs,
+    /// Write-watch askings answered from the journal (not in `Watches`).
+    JournalHits,
+    /// Merged refreshes done and their time (every range, not the ten
+    /// listed below).
+    Updates,
+    UpdateUs,
+    /// Not a counter: their number.
+    Count,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = C::Count as usize;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -98,14 +123,14 @@ pub(crate) fn log(frames: f64) {
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
-        "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
+        "copies per frame: {:.1} submissions; {:.0} title copies and fills {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
-        c[C::Copies as usize],
-        mb(c[C::CopyBytes as usize]),
+        c[C::Copies as usize] + c[C::Fills as usize],
+        mb(c[C::CopyBytes as usize] + c[C::FillBytes as usize]),
         c[C::Refreshes as usize],
         mb(c[C::RefreshBytes as usize]),
         c[C::Skipped as usize],
@@ -126,6 +151,29 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
+    );
+    // Where the copy time goes. Moves (above; the reads of whole runs), the
+    // walks, committed and opening guards do not overlap, and are all
+    // inside the refreshes, copies and fills.
+    tracing::info!(
+        "copy path per frame: {:.0} title copies {:.1} MB, {:.0} fills {:.1} MB; {:.0} merged \
+         refreshes {:.2} ms; {:.0} failed reads, fallback walks {:.2} ms; title destinations: \
+         committed {:.2} ms, opening guards {:.2} ms; {:.0} allocation lookups ({:.0} walked) \
+         {:.2} ms; {:.0} watches answered from the journal",
+        c[C::Copies as usize],
+        mb(c[C::CopyBytes as usize]),
+        c[C::Fills as usize],
+        mb(c[C::FillBytes as usize]),
+        c[C::Updates as usize],
+        ms(c[C::UpdateUs as usize]),
+        c[C::FailedReads as usize],
+        ms(c[C::FallbackUs as usize]),
+        ms(c[C::CommittedUs as usize]),
+        ms(c[C::WritingUs as usize]),
+        c[C::Allocations as usize],
+        c[C::RegionWalks as usize],
+        ms(c[C::AllocationUs as usize]),
+        c[C::JournalHits as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

@@ -1200,8 +1200,8 @@ impl HostList {
                 &Step::Fill(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
+                        add(C::Fills, 1);
+                        add(C::FillBytes, len as u64);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
@@ -1294,7 +1294,11 @@ impl Batch {
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            {
+                crate::copystat::range(from, to - from, us, 0);
+                crate::copystat::add(crate::copystat::C::Updates, 1);
+                crate::copystat::add(crate::copystat::C::UpdateUs, us);
+            }
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
@@ -1312,6 +1316,8 @@ impl Batch {
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
+    use crate::copystat::{C, add};
+    #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
@@ -1321,30 +1327,48 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     if title_dst {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let committed = crate::texture::committed(dst, len);
+        #[cfg(feature = "diagnostics")]
+        add(C::CommittedUs, started.elapsed().as_micros() as u64);
+        if !committed {
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
+        #[cfg(feature = "diagnostics")]
+        add(C::WritingUs, started.elapsed().as_micros() as u64);
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
-    if whole {
-        return;
+    add(C::MoveUs, moved.elapsed().as_micros() as u64);
+    if !whole {
+        walk(dst, src as usize, len);
     }
+}
+
+/// Copies `len` bytes of title memory at `src` into `dst` after a read of
+/// them failed: something is unmapped, so page by page (64 KiB, then 4 KiB
+/// in a piece that fails), zeros for what cannot be read.
+fn walk(dst: *mut u8, src: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
+    for_pieces(src, len, 64 << 10, |at, n| {
+        let to = dst.wrapping_add(at - src);
         if !read(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
+                let to = dst.wrapping_add(at - src);
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
@@ -1354,6 +1378,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             });
         }
     });
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::FallbackUs,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1370,7 +1399,14 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let read = unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+    };
+    #[cfg(feature = "diagnostics")]
+    if !read {
+        crate::copystat::add(crate::copystat::C::FailedReads, 1);
+    }
+    read
 }
 
 /// Copies host memory into title memory after a submission (what shaders

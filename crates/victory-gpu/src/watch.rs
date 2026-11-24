@@ -77,6 +77,19 @@ struct Region {
 /// allocation's regions under Wine costs one VirtualQuery each). Those
 /// above 4 GiB are not asked about whole.
 fn allocation(at: usize) -> Option<Region> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let region = allocation_now(at);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Allocations, 1);
+        add(C::AllocationUs, started.elapsed().as_micros() as u64);
+    }
+    region
+}
+
+fn allocation_now(at: usize) -> Option<Region> {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let page = at / PAGE;
     // Known allocations first: under Wine VirtualQuery takes the same lock
@@ -93,6 +106,8 @@ fn allocation(at: usize) -> Option<Region> {
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
         (n != 0).then_some(info)
     };
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::RegionWalks, 1);
     let info = query(at)?;
     let base = info.AllocationBase as usize;
     if base == 0 {
@@ -171,6 +186,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     if on_wine() && j.asked_now.iter().any(|&(f, l)| f <= first && last <= l) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::JournalHits, 1);
         j.asked += 1;
         return Some((
             j.asked,
