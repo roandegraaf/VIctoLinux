@@ -34,9 +34,9 @@ jobs:
 
   # The crates that do not need the Windows host build and test on Linux too,
   # so a change to them is checked on both and can be worked on without
-  # Windows. victory-gpu builds here and runs its host-independent tests; it
-  # is left out of clippy because code used only by the Windows host shows
-  # as unused.
+  # Windows. victory-gpu and victory-hle build here and run their
+  # host-independent tests; they are left out of clippy because code used
+  # only by the Windows host shows as unused.
   linux:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -50,5 +50,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy, portable crates
         run: cargo clippy $PORTABLE --all-targets --locked -- -D warnings
-      - name: Tests, portable crates and victory-gpu
-        run: cargo test $PORTABLE -p victory-gpu --locked
+      - name: Tests, portable crates, victory-gpu and victory-hle
+        run: cargo test $PORTABLE -p victory-gpu -p victory-hle --locked

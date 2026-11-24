@@ -85,6 +85,27 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+## Working on Linux
+
+The title runs on Windows only, but most crates build and test elsewhere.
+On Linux (the `linux` CI job runs the same):
+
+```sh
+cargo test -p victory-core -p victory-pe -p victory-formats -p victory-shader \
+  -p victory-pipeline -p victory-game -p xtask -p victory-gpu -p victory-hle
+```
+
+Tests that need a Windows host or GPU (the shader execution tests, DXIL
+validation, the loader) are left out there. The Windows code can still be
+checked from Linux; with LLVM's `clang-cl` and `llvm-lib` for the C parts
+of dependencies:
+
+```sh
+rustup target add x86_64-pc-windows-msvc   # already in rust-toolchain.toml
+CC_x86_64_pc_windows_msvc=clang-cl AR_x86_64_pc_windows_msvc=llvm-lib \
+  cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+```
+
 ## Commands
 
 ```
