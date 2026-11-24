@@ -811,3 +811,220 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         whole + 2 * derivs + packed
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::decode;
+    use super::*;
+
+    /// The instruction in `words` (a program of it and `s_endpgm`), with its
+    /// operand fields (wave32).
+    fn one(words: &[u32]) -> (&'static str, Fields) {
+        let bytes: Vec<u8> = words
+            .iter()
+            .chain(&[0xBF81_0000])
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let program = decode(&bytes).unwrap();
+        assert_eq!(program.len(), 2, "{program:?}");
+        (program[0].name().unwrap(), program[0].fields(false))
+    }
+
+    #[test]
+    fn source_codes() {
+        assert_eq!(source(0, 1, 0), scalar(0, 1));
+        assert_eq!(source(106, 2, 0), scalar(VCC, 2));
+        assert_eq!(source(127, 1, 0), scalar(127, 1));
+        assert_eq!(source(128, 1, 0), Operand::Const(128));
+        assert_eq!(source(254, 1, 0), Operand::Const(254));
+        assert_eq!(source(255, 1, 0x3F80_0000), Operand::Literal(0x3F80_0000));
+        assert_eq!(source(256, 1, 0), vector(0, 1));
+        assert_eq!(source(511, 2, 0), vector(255, 2));
+    }
+
+    #[test]
+    fn scalar_alu_sizes() {
+        assert_eq!(salu_dwords("s_mov_b32"), (1, 1, 1));
+        assert_eq!(salu_dwords("s_and_saveexec_b64"), (2, 2, 2));
+        // Shift amounts, field specs and bit indices stay 32-bit.
+        assert_eq!(salu_dwords("s_lshl_b64"), (2, 2, 1));
+        assert_eq!(salu_dwords("s_bfe_u64"), (2, 2, 1));
+        assert_eq!(salu_dwords("s_bitset1_b64"), (2, 1, 1));
+        // Counts of a 64-bit source are 32-bit.
+        assert_eq!(salu_dwords("s_bcnt1_i32_b64"), (1, 2, 2));
+        assert_eq!(salu_dwords("s_ff1_i32_b64"), (1, 2, 2));
+        assert_eq!(salu_dwords("s_pack_ll_b32_b16"), (1, 1, 1));
+    }
+
+    #[test]
+    fn vector_alu_sizes() {
+        assert_eq!(valu_dwords("v_add_f32"), (1, [1; 3]));
+        assert_eq!(valu_dwords("v_fma_f64"), (2, [2; 3]));
+        assert_eq!(valu_dwords("v_cvt_f64_f32"), (2, [1; 3]));
+        assert_eq!(valu_dwords("v_cvt_i32_f64"), (1, [2; 3]));
+        assert_eq!(valu_dwords("v_cvt_f32_ubyte0"), (1, [1; 3]));
+        assert_eq!(valu_dwords("v_lshlrev_b64"), (2, [1, 2, 2]));
+        assert_eq!(valu_dwords("v_ldexp_f64"), (2, [2, 1, 2]));
+        assert_eq!(valu_dwords("v_mad_u64_u32"), (2, [1, 1, 2]));
+        assert_eq!(valu_dwords("v_frexp_exp_i32_f64"), (1, [2; 3]));
+    }
+
+    #[test]
+    fn data_sizes_from_names() {
+        assert_eq!(data_dwords("buffer_load_dword"), 1);
+        assert_eq!(data_dwords("buffer_load_ubyte"), 1);
+        assert_eq!(data_dwords("global_store_dwordx3"), 3);
+        assert_eq!(data_dwords("s_buffer_load_dwordx16"), 16);
+        assert_eq!(data_dwords("ds_read_b96"), 3);
+        assert_eq!(data_dwords("ds_write2_b64"), 2);
+        assert_eq!(data_dwords("tbuffer_load_format_xyzw"), 4);
+        // Packed halves: three of them take two dwords.
+        assert_eq!(data_dwords("buffer_load_format_d16_xyz"), 2);
+        assert_eq!(data_dwords("buffer_store_format_d16_x"), 1);
+        // Compare-and-swap carries the value and the comparand.
+        assert_eq!(data_dwords("buffer_atomic_cmpswap"), 2);
+        assert_eq!(data_dwords("global_atomic_cmpswap_x2"), 4);
+        assert_eq!(data_dwords("flat_atomic_fcmpswap_x2"), 4);
+    }
+
+    #[test]
+    fn image_address_sizes() {
+        const D1: u8 = 0;
+        const D2: u8 = 1;
+        const D3: u8 = 2;
+        const CUBE: u8 = 3;
+        const MSAA_ARRAY: u8 = 7;
+        assert_eq!(image_addr_dwords("image_sample", D2, false), 2);
+        assert_eq!(image_addr_dwords("image_sample_lz", D3, false), 3);
+        assert_eq!(image_addr_dwords("image_sample_l", CUBE, false), 4);
+        // Offset, bias and compare whole; gradients per direction; then the
+        // coordinates and the clamp.
+        assert_eq!(image_addr_dwords("image_sample_c_b_o", D2, false), 5);
+        assert_eq!(image_addr_dwords("image_sample_d", D2, false), 6);
+        assert_eq!(
+            image_addr_dwords("image_sample_c_d_cl_o", D3, false),
+            2 + 6 + 4
+        );
+        assert_eq!(image_addr_dwords("image_gather4_c_lz", D2, false), 3);
+        assert_eq!(image_addr_dwords("image_load_mip", D1, false), 2);
+        assert_eq!(image_addr_dwords("image_load", MSAA_ARRAY, false), 4);
+        assert_eq!(image_addr_dwords("image_get_resinfo", D3, false), 1);
+        // a16 packs coordinates and each direction's gradients in pairs.
+        assert_eq!(image_addr_dwords("image_sample", D2, true), 1);
+        assert_eq!(image_addr_dwords("image_sample_l", D3, true), 2);
+        assert_eq!(image_addr_dwords("image_sample_d", D3, true), 4 + 2);
+        assert_eq!(image_addr_dwords("image_sample_c_d", D1, true), 1 + 2 + 1);
+        assert_eq!(image_addr_dwords("image_bvh_intersect_ray", D1, false), 11);
+        assert_eq!(image_addr_dwords("image_bvh64_intersect_ray", D1, true), 9);
+    }
+
+    #[test]
+    fn scalar_move_of_a_literal() {
+        let (name, fields) = one(&[0xBE80_03FF, 0x3F80_0000]);
+        assert_eq!(name, "s_mov_b32");
+        assert_eq!(
+            fields,
+            Fields::Sop {
+                dst: Some(scalar(0, 1)),
+                src: vec![Operand::Literal(0x3F80_0000)],
+                imm: None,
+            }
+        );
+    }
+
+    #[test]
+    fn scalar_load_with_a_negative_offset() {
+        // s_load_dwordx4 s[4:7], s[2:3], -8 glc
+        let (name, fields) = one(&[0xF408_0101 | 1 << 16, 0xFA1F_FFF8]);
+        assert_eq!(name, "s_load_dwordx4");
+        assert_eq!(
+            fields,
+            Fields::Smem {
+                data: Some(scalar(4, 4)),
+                base: scalar(2, 2),
+                offset: -8,
+                soffset: scalar(NULL, 1),
+                cache: Cache {
+                    glc: true,
+                    slc: false,
+                    dlc: false,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn lds_pairs() {
+        // ds_write2_b32 v1, v2, v3 offset0:1 offset1:2
+        let (name, fields) = one(&[0xD838_0201, 0x0003_0201]);
+        assert_eq!(name, "ds_write2_b32");
+        assert_eq!(
+            fields,
+            Fields::Ds {
+                dst: None,
+                addr: Some(vector(1, 1)),
+                data: vec![vector(2, 1), vector(3, 1)],
+                offset0: 1,
+                offset1: 2,
+                gds: false,
+            }
+        );
+        // ds_read2_b64 v[4:7], v1 offset1:1
+        let (name, fields) = one(&[0xD9DC_0100, 0x0400_0001]);
+        assert_eq!(name, "ds_read2_b64");
+        assert_eq!(
+            fields,
+            Fields::Ds {
+                dst: Some(vector(4, 4)),
+                addr: Some(vector(1, 1)),
+                data: vec![],
+                offset0: 0,
+                offset1: 1,
+                gds: false,
+            }
+        );
+    }
+
+    #[test]
+    fn buffer_load_with_an_offset_and_an_inline_soffset() {
+        // buffer_load_dwordx2 v[2:3], v1, s[8:11], 0 offen offset:16
+        let (name, fields) = one(&[0xE034_1010, 0x8002_0201]);
+        assert_eq!(name, "buffer_load_dwordx2");
+        let Fields::Buffer {
+            data,
+            addr,
+            rsrc,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            ..
+        } = fields
+        else {
+            panic!("{fields:?}");
+        };
+        assert_eq!(data, Some(vector(2, 2)));
+        assert_eq!(addr, vector(1, 1));
+        assert_eq!(rsrc, scalar(8, 4));
+        assert_eq!(soffset, Operand::Const(128));
+        assert_eq!((offset, offen, idxen), (16, true, false));
+    }
+
+    #[test]
+    fn compares_write_a_lane_mask_sized_by_the_wave() {
+        // v_cmp_lt_f32 vcc, v0, v1
+        let bytes: Vec<u8> = [0x7C02_0300u32, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let program = decode(&bytes).unwrap();
+        assert_eq!(program[0].name(), Some("v_cmp_lt_f32"));
+        for (wave64, lanes) in [(false, 1), (true, 2)] {
+            let Fields::Valu(v) = program[0].fields(wave64) else {
+                panic!();
+            };
+            assert_eq!(v.dst, Some(scalar(VCC, lanes)), "wave64 {wave64}");
+            assert_eq!(v.src, vec![vector(0, 1), vector(1, 1)]);
+        }
+    }
+}

@@ -380,6 +380,36 @@ mod tests {
     }
 
     #[test]
+    fn names_are_unique_and_match_their_encoding() {
+        for (table, prefix) in [
+            (opcodes::SOP2, "s_"),
+            (opcodes::SOPK, "s_"),
+            (opcodes::SOP1, "s_"),
+            (opcodes::SOPC, "s_"),
+            (opcodes::SOPP, "s_"),
+            (opcodes::SMEM, "s_"),
+            (opcodes::VOP2, "v_"),
+            (opcodes::VOP1, "v_"),
+            (opcodes::VOPC, "v_cmp"),
+            (opcodes::VOP3, "v_"),
+            (opcodes::VOP3P, "v_"),
+            (opcodes::VINTRP, "v_interp_"),
+            (opcodes::DS, "ds_"),
+            (opcodes::MUBUF, "buffer_"),
+            (opcodes::MTBUF, "tbuffer_"),
+            (opcodes::MIMG, "image_"),
+            (opcodes::FLAT, "flat_"),
+            (opcodes::GLOBAL, "global_"),
+            (opcodes::SCRATCH, "scratch_"),
+        ] {
+            let mut names: Vec<&str> = table.iter().map(|&(_, n)| n).collect();
+            assert!(names.iter().all(|n| n.starts_with(prefix)), "{prefix}");
+            names.sort_unstable();
+            assert!(names.windows(2).all(|w| w[0] != w[1]), "{prefix}");
+        }
+    }
+
+    #[test]
     fn lengths_and_names() {
         let code = [
             0xBE80_03FF,
