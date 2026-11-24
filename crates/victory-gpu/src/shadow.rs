@@ -53,11 +53,12 @@ pub(crate) struct Shadow {
 /// Block snapshots kept for reuse.
 static PIECES: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-/// Returns block snapshots for reuse (64 MB of them at most).
+/// Returns block snapshots for reuse (256 MB of them at most: fresh ones
+/// cost a page fault per 4 KiB, see [`Shadow::writing`]).
 fn pieces_done(pieces: impl IntoIterator<Item = Vec<u8>>) {
     let mut pool = PIECES.lock().unwrap_or_else(|e| e.into_inner());
     for piece in pieces {
-        if pool.len() < 1024 {
+        if pool.len() < 4096 {
             pool.push(piece);
         }
     }
@@ -395,9 +396,8 @@ impl Shadow {
                     copied[block - base] == 0 || write > copied[block - base]
                 };
                 pieces
-                    .keys()
-                    .copied()
-                    .filter(|b| (first..last).contains(b))
+                    .range(first..last)
+                    .map(|(&b, _)| b)
                     .filter(|&b| !stale(b) && !foreign.iter().any(|&(a, e)| a < (b + 1) * PAGE && e > b * PAGE))
                     .collect()
             } else {

@@ -30,11 +30,16 @@
 //! the handler takes only this lock. A thread that faults holds any locks
 //! of the title's or ours, so nothing here waits for another thread.
 //!
-//! shortcut: giving a block back is not atomic for the title's other
-//! threads: between the protection change and the write of the copy's
-//! bytes (one 64 KiB kernel write) another thread reads the older bytes,
-//! and a write of its own there is lost. Private memory has no second view
-//! to fill it through; section-backed title memory would.
+//! Giving a block back: its bytes first, then access, so that no other
+//! thread of the title sees the block open with its older bytes. A closed
+//! page takes no write of ours, the kernel's included; under Wine the Linux
+//! kernel's file of the process's memory does write it ([`through`]).
+//!
+//! shortcut: on Windows itself there is no such way in: access is given
+//! first and the bytes written after (one 64 KiB kernel write). Another
+//! thread that uses the block in between reads the older bytes, and a write
+//! of its own there is lost. Section-backed title memory could be filled
+//! through a second view.
 //! shortcut: the title's own `VirtualProtect` state is taken to be
 //! read-write (checked on the first page of each run only).
 
@@ -432,6 +437,8 @@ pub(crate) fn acquire(src: Source, keep: &Keep, blocks: &[usize]) -> Vec<usize> 
         return Vec::new();
     }
     install();
+    // Opened here, not at the first fault.
+    through();
     let started = std::time::Instant::now();
     let mut state = lock();
     let state = &mut *state;
@@ -552,25 +559,27 @@ enum Why {
 /// Gives `block` back to the title: access, then the copy's bytes. False if
 /// it was not owned, or its memory is gone.
 fn give_back(state: &mut State, block: usize, why: Why) -> bool {
-    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, PAGE_READWRITE};
     let Some(held) = state.blocks.remove(&block) else {
         return false;
     };
     HELD.store(state.blocks.len(), Relaxed);
     let (from, to) = held.src.part(block);
     let host = held.src.host(from);
-    let mut landed = protect(block, block + 1, PAGE_READWRITE).is_some();
-    if landed && held.pending {
-        // One read of the copy, which shaders may be writing: title memory
-        // gets exactly the bytes the later comparison is made with.
-        // SAFETY: inside the copy, kept alive by `held.keep`.
-        let bytes = unsafe { std::slice::from_raw_parts(host, to - from) }.to_vec();
-        landed = write(from, bytes.as_ptr(), bytes.len());
-        if landed {
-            state.saved.insert(block, Saved { id: held.src.id, at: from, bytes });
-        }
-    } else if landed {
-        landed = write(from, host, to - from);
+    // One read of the copy if shaders may be writing it: title memory gets
+    // exactly the bytes the later comparison is made with.
+    // SAFETY: inside the copy, kept alive by `held.keep`.
+    let kept = held.pending.then(|| unsafe { std::slice::from_raw_parts(host, to - from) }.to_vec());
+    let bytes = kept.as_ref().map_or(host, |k| k.as_ptr());
+    // The bytes, then access; where a closed page cannot be written (or
+    // that write fails), access first. Closing it again first tells
+    // whether it is all still committed: the kernel's file writes
+    // decommitted pages too.
+    let landed = protect(block, block + 1, PAGE_NOACCESS).is_some()
+        && ((fill(from, bytes, to - from) && protect(block, block + 1, PAGE_READWRITE).is_some())
+            || (protect(block, block + 1, PAGE_READWRITE).is_some() && write(from, bytes, to - from)));
+    if let Some(bytes) = kept.filter(|_| landed) {
+        state.saved.insert(block, Saved { id: held.src.id, at: from, bytes });
     }
     state.retired.push(held.keep);
     if !landed {
@@ -603,6 +612,151 @@ fn write(dst: usize, src: *const u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the source is mapped; the kernel checks the destination.
     len == 0 || unsafe { WriteProcessMemory(GetCurrentProcess(), dst as _, src.cast(), len, &mut done) != 0 }
+}
+
+/// Under Wine: this process's memory as the Linux kernel's file of it
+/// (`/proc/<pid>/mem`), whose writes land in pages whatever their
+/// protection. `None` where there is none, or it does not write a closed
+/// page (the kernel can be told not to: `proc_mem.force_override`).
+///
+/// Wine's server opens files, so `/proc/self` is the server; and nothing
+/// tells a Windows process its Linux process number. So the processes are
+/// tried: ours is the one whose memory, read at the address of a page of
+/// ours, holds what we put there.
+fn through() -> Option<isize> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FindClose, FindFirstFileW, FindNextFileW,
+        OPEN_EXISTING, WIN32_FIND_DATAW,
+    };
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        VirtualProtect,
+    };
+    static FILE: std::sync::OnceLock<Option<isize>> = std::sync::OnceLock::new();
+    *FILE.get_or_init(|| {
+        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        // The processes, newest first (ours is among the newest).
+        let mut processes: Vec<u32> = Vec::new();
+        // SAFETY: plain data filled in by the search; the handle is closed.
+        unsafe {
+            let mut found: WIN32_FIND_DATAW = std::mem::zeroed();
+            let search = FindFirstFileW(wide(r"\\?\unix\proc\*").as_ptr(), &mut found);
+            if search == INVALID_HANDLE_VALUE {
+                return None; // not Wine on Linux
+            }
+            loop {
+                let name = &found.cFileName;
+                let name = String::from_utf16_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(0)]);
+                processes.extend(name.parse::<u32>().ok());
+                if FindNextFileW(search, &mut found) == 0 {
+                    break;
+                }
+            }
+            FindClose(search);
+        }
+        processes.sort_unstable_by_key(|&p| std::cmp::Reverse(p));
+        // A page of ours holding what no other process holds there.
+        // SAFETY: a fresh allocation, freed below.
+        let page = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        if page.is_null() {
+            return None;
+        }
+        let page = page.cast::<u8>();
+        let mark: [u8; 16] = {
+            use std::hash::{BuildHasher, Hasher};
+            let random = || std::collections::hash_map::RandomState::new().build_hasher().finish();
+            let mut mark = [0; 16];
+            mark[..8].copy_from_slice(&random().to_ne_bytes());
+            mark[8..].copy_from_slice(&random().to_ne_bytes());
+            mark
+        };
+        // SAFETY: inside the page.
+        unsafe { page.copy_from_nonoverlapping(mark.as_ptr(), 16) };
+        let mut file = None;
+        for process in processes {
+            let path = wide(&format!(r"\\?\unix\proc\{process}\mem"));
+            // SAFETY: a NUL-terminated path; closed unless it is ours.
+            unsafe {
+                let handle = CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                    continue;
+                }
+                let mut read = [0u8; 16];
+                if pread(handle as isize, page as usize, &mut read) && read == mark {
+                    file = Some(handle as isize);
+                    break;
+                }
+                CloseHandle(handle);
+            }
+        }
+        // Ours: does it write a closed page?
+        let works = file.is_some_and(|file| {
+            // SAFETY: our page: closed, written through the file, opened and
+            // read.
+            unsafe {
+                let mut old = 0;
+                VirtualProtect(page.cast(), BLOCK, PAGE_NOACCESS, &mut old);
+                let written = pwrite(file, page as usize, [0x5au8; 16].as_ptr(), 16);
+                VirtualProtect(page.cast(), BLOCK, PAGE_READWRITE, &mut old);
+                written && page.read_volatile() == 0x5a && page.add(15).read_volatile() == 0x5a
+            }
+        });
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+        tracing::info!(found = file.is_some(), works, "title memory through the kernel's file of it");
+        file.filter(|_| works)
+    })
+}
+
+/// Reads `into.len()` bytes of `file` at offset `at`.
+fn pread(file: isize, at: usize, into: &mut [u8]) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    // SAFETY: plain data; zero is a valid value.
+    let mut place: OVERLAPPED = unsafe { std::mem::zeroed() };
+    place.Anonymous.Anonymous.Offset = at as u32;
+    place.Anonymous.Anonymous.OffsetHigh = (at >> 32) as u32;
+    let mut done = 0;
+    // SAFETY: the destination is ours; the place and the count too.
+    let ok = unsafe { ReadFile(file as _, into.as_mut_ptr(), into.len() as u32, &mut done, &mut place) } != 0;
+    ok && done as usize == into.len()
+}
+
+/// Writes `len` bytes at `src` to `file` at offset `at`.
+fn pwrite(file: isize, at: usize, src: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    // SAFETY: plain data; zero is a valid value.
+    let mut place: OVERLAPPED = unsafe { std::mem::zeroed() };
+    place.Anonymous.Anonymous.Offset = at as u32;
+    place.Anonymous.Anonymous.OffsetHigh = (at >> 32) as u32;
+    let mut done = 0;
+    // SAFETY: the source is mapped memory of `len` bytes; the place and the
+    // count are ours.
+    let ok = unsafe { WriteFile(file as _, src, len as u32, &mut done, &mut place) } != 0;
+    ok && done as usize == len
+}
+
+/// Writes `len` bytes at `src` into title memory at `dst` while its pages
+/// are closed; false if that cannot be done here.
+fn fill(dst: usize, src: *const u8, len: usize) -> bool {
+    len == 0 || through().is_some_and(|file| pwrite(file, dst, src, len))
+}
+
+/// Whether a block goes back to the title with its bytes before it opens
+/// (see the module's notes).
+#[cfg(test)]
+pub(crate) fn fills_closed() -> bool {
+    through().is_some()
 }
 
 /// Before we read or write title memory `[at, at + len)` in a way that
@@ -779,7 +933,9 @@ unsafe extern "system" fn on_access(
     let taken = if state.blocks.contains_key(&block) {
         let given = give_back(&mut state, block, Why::Touch);
         add(S::FaultUs, started.elapsed().as_micros() as u64);
-        given
+        // Not given (part of it is gone): the access may still be to a
+        // page that is there, and open now.
+        given || accessible(at, kind)
     } else {
         // A block we closed at some time, open now: another thread got it
         // back between this one's fault and its turn here.
@@ -992,25 +1148,59 @@ mod tests {
     }
 
     /// Many threads touching one block at once: one copy back, and none of
-    /// them sees the fault.
+    /// them sees the fault. Where a closed block can be filled (under
+    /// Wine), none of them sees the older bytes either, and no write of
+    /// theirs is lost.
     #[test]
     fn threads_touching_one_block_take_it_once() {
         let _on = force(true);
-        let title = Title::new(2, 1, 2);
+        let title = Title::new(64, 1, 2);
         let touches = stat(S::Touches);
-        assert_eq!(title.take(), [0, 1]);
-        let go = std::sync::Barrier::new(8);
-        std::thread::scope(|s| {
-            for i in 0..8 {
-                let (title, go) = (&title, &go);
-                s.spawn(move || {
-                    go.wait();
-                    assert_eq!(title.read(BLOCK + i * 4096), 2);
-                });
+        assert_eq!(title.take(), (0..64).collect::<Vec<_>>());
+        let atomic = fills_closed();
+        for block in 1..64 {
+            let go = std::sync::Barrier::new(8);
+            let read: Vec<(u8, u8)> = std::thread::scope(|s| {
+                let threads: Vec<_> = (0..8)
+                    .map(|i| {
+                        let (title, go) = (&title, &go);
+                        s.spawn(move || {
+                            go.wait();
+                            // A read, then a write the fill must not undo.
+                            let at = block * BLOCK + i * 4096;
+                            let read = title.read(at);
+                            title.write(at + 1, 9);
+                            (read, title.read(at + 1))
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|t| t.join().unwrap()).collect()
+            });
+            if atomic {
+                assert_eq!(read, [(2, 9); 8], "block {block}");
             }
-        });
-        assert_eq!(stat(S::Touches) - touches, 1);
+            assert_eq!(title.read(block * BLOCK + 2), 2);
+        }
+        assert_eq!(stat(S::Touches) - touches, 63);
         assert_eq!(title.held(), [0]);
+    }
+
+    /// Under Wine a block gets its bytes while it is still closed (the
+    /// test above then checks what that gives). This fails where Wine's
+    /// server may not open the process's memory file.
+    #[test]
+    fn closed_blocks_are_filled_under_wine() {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        let wine = unsafe {
+            GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr().cast()), c"wine_get_version".as_ptr().cast())
+        }
+        .is_some();
+        if !wine {
+            assert!(!fills_closed());
+            return;
+        }
+        assert!(fills_closed(), "no way into closed pages: the process's memory file refused");
     }
 
     /// A block given back while shaders may still write its copy: title
