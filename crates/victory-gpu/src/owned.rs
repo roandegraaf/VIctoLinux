@@ -32,8 +32,9 @@
 //!
 //! Giving a block back: its bytes first, then access, so that no other
 //! thread of the title sees the block open with its older bytes. A closed
-//! page takes no write of ours, the kernel's included; under Wine the Linux
-//! kernel's file of the process's memory does write it ([`through`]).
+//! page takes no write of ours, `WriteProcessMemory`'s included; under Wine
+//! the Linux kernel's file of our own process's memory does write it
+//! ([`through`]).
 //!
 //! shortcut: on Windows itself there is no such way in: access is given
 //! first and the bytes written after (one 64 KiB kernel write). Another
@@ -619,15 +620,21 @@ fn write(dst: usize, src: *const u8, len: usize) -> bool {
 /// protection. `None` where there is none, or it does not write a closed
 /// page (the kernel can be told not to: `proc_mem.force_override`).
 ///
-/// Wine's server opens files, so `/proc/self` is the server; and nothing
-/// tells a Windows process its Linux process number. So the processes are
-/// tried: ours is the one whose memory, read at the address of a page of
-/// ours, holds what we put there.
+/// `WriteProcessMemory` does not do it: Wine's server writes with
+/// `process_vm_writev`, which keeps to the pages' protection, and its
+/// ptrace path asks for write access first (error 998 on a closed page,
+/// with the pseudo handle and with a real one).
+///
+/// Wine's server opens files, so `/proc/self` is the server, and nothing
+/// tells a Windows process its Linux process number. We find it from
+/// public data only, as `ps` reads it: a thread of ours takes a random
+/// name, which Wine gives the Linux thread too, and the process with a
+/// thread of that name (`/proc/<pid>/task/<tid>/comm`) is ours. No other
+/// process's memory file is opened.
 fn through() -> Option<isize> {
-    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FindClose, FindFirstFileW, FindNextFileW,
-        OPEN_EXISTING, WIN32_FIND_DATAW,
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -635,106 +642,111 @@ fn through() -> Option<isize> {
     };
     static FILE: std::sync::OnceLock<Option<isize>> = std::sync::OnceLock::new();
     *FILE.get_or_init(|| {
-        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-        // The processes, newest first (ours is among the newest).
-        let mut processes: Vec<u32> = Vec::new();
-        // SAFETY: plain data filled in by the search; the handle is closed.
+        let process = linux_process()?;
+        let path: Vec<u16> = format!(r"\\?\unix\proc\{process}\mem").encode_utf16().chain([0]).collect();
+        // SAFETY: a NUL-terminated path; the handle is kept for good.
+        let file = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if file == INVALID_HANDLE_VALUE || file.is_null() {
+            tracing::info!(process, "our memory file cannot be opened: blocks open before their bytes");
+            return None;
+        }
+        let file = file as isize;
+        // Is it ours, and does it write a closed page? A page of ours is
+        // closed, written through the file, opened and read.
+        // SAFETY: a fresh allocation, freed here.
+        let works = unsafe {
+            let page = VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            if page.is_null() {
+                return None;
+            }
+            let mut old = 0;
+            VirtualProtect(page.cast(), BLOCK, PAGE_NOACCESS, &mut old);
+            let written = pwrite(file, page as usize, [0x5au8; 16].as_ptr(), 16);
+            VirtualProtect(page.cast(), BLOCK, PAGE_READWRITE, &mut old);
+            let works = written && page.read_volatile() == 0x5a && page.add(15).read_volatile() == 0x5a;
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+            works
+        };
+        tracing::info!(process, works, "title memory through the kernel's file of it");
+        works.then_some(file)
+    })
+}
+
+/// Under Wine on Linux: this process's Linux number, found by the name of
+/// one of its threads (see [`through`]).
+fn linux_process() -> Option<u32> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW};
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadDescription};
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    // The numbered entries of a directory of `/proc`.
+    let numbers = |pattern: &str| -> Vec<u32> {
+        let mut numbers = Vec::new();
+        // SAFETY: plain data filled in by the search, which is closed.
         unsafe {
             let mut found: WIN32_FIND_DATAW = std::mem::zeroed();
-            let search = FindFirstFileW(wide(r"\\?\unix\proc\*").as_ptr(), &mut found);
+            let search = FindFirstFileW(wide(pattern).as_ptr(), &mut found);
             if search == INVALID_HANDLE_VALUE {
-                return None; // not Wine on Linux
+                return numbers;
             }
             loop {
                 let name = &found.cFileName;
                 let name = String::from_utf16_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(0)]);
-                processes.extend(name.parse::<u32>().ok());
+                numbers.extend(name.parse::<u32>().ok());
                 if FindNextFileW(search, &mut found) == 0 {
                     break;
                 }
             }
             FindClose(search);
         }
-        processes.sort_unstable_by_key(|&p| std::cmp::Reverse(p));
-        // A page of ours holding what no other process holds there.
-        // SAFETY: a fresh allocation, freed below.
-        let page = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
-        if page.is_null() {
-            return None;
-        }
-        let page = page.cast::<u8>();
-        let mark: [u8; 16] = {
-            use std::hash::{BuildHasher, Hasher};
-            let random = || std::collections::hash_map::RandomState::new().build_hasher().finish();
-            let mut mark = [0; 16];
-            mark[..8].copy_from_slice(&random().to_ne_bytes());
-            mark[8..].copy_from_slice(&random().to_ne_bytes());
-            mark
-        };
-        // SAFETY: inside the page.
-        unsafe { page.copy_from_nonoverlapping(mark.as_ptr(), 16) };
-        let mut file = None;
-        for process in processes {
-            let path = wide(&format!(r"\\?\unix\proc\{process}\mem"));
-            let open = |access: u32| {
-                // SAFETY: a NUL-terminated path.
-                let handle = unsafe {
-                    CreateFileW(
-                        path.as_ptr(),
-                        access,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE,
-                        std::ptr::null(),
-                        OPEN_EXISTING,
-                        0,
-                        std::ptr::null_mut(),
-                    )
-                };
-                (handle != INVALID_HANDLE_VALUE && !handle.is_null()).then_some(handle)
-            };
-            // Others' are opened for reading only, and read at one place.
-            let Some(handle) = open(GENERIC_READ) else {
-                continue;
-            };
-            let mut read = [0u8; 16];
-            let ours = pread(handle as isize, page as usize, &mut read) && read == mark;
-            // SAFETY: a handle we opened.
-            unsafe { CloseHandle(handle) };
-            if ours {
-                file = open(GENERIC_WRITE).map(|h| h as isize);
-                break;
-            }
-        }
-        // Ours: does it write a closed page?
-        let works = file.is_some_and(|file| {
-            // SAFETY: our page: closed, written through the file, opened and
-            // read.
-            unsafe {
-                let mut old = 0;
-                VirtualProtect(page.cast(), BLOCK, PAGE_NOACCESS, &mut old);
-                let written = pwrite(file, page as usize, [0x5au8; 16].as_ptr(), 16);
-                VirtualProtect(page.cast(), BLOCK, PAGE_READWRITE, &mut old);
-                written && page.read_volatile() == 0x5a && page.add(15).read_volatile() == 0x5a
-            }
-        });
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
-        tracing::info!(found = file.is_some(), works, "title memory through the kernel's file of it");
-        file.filter(|_| works)
-    })
-}
-
-/// Reads `into.len()` bytes of `file` at offset `at`.
-fn pread(file: isize, at: usize, into: &mut [u8]) -> bool {
-    use windows_sys::Win32::Storage::FileSystem::ReadFile;
-    use windows_sys::Win32::System::IO::OVERLAPPED;
-    // SAFETY: plain data; zero is a valid value.
-    let mut place: OVERLAPPED = unsafe { std::mem::zeroed() };
-    place.Anonymous.Anonymous.Offset = at as u32;
-    place.Anonymous.Anonymous.OffsetHigh = (at >> 32) as u32;
-    let mut done = 0;
-    // SAFETY: the destination is ours; the place and the count too.
-    let ok = unsafe { ReadFile(file as _, into.as_mut_ptr(), into.len() as u32, &mut done, &mut place) } != 0;
-    ok && done as usize == into.len()
+        numbers
+    };
+    let mut processes = numbers(r"\\?\unix\proc\*");
+    if processes.is_empty() {
+        return None; // not Wine on Linux
+    }
+    // Ours is among the newest.
+    processes.sort_unstable_by_key(|&p| std::cmp::Reverse(p));
+    // A name no other thread has: 15 characters, what Linux keeps.
+    let name = {
+        use std::hash::{BuildHasher, Hasher};
+        let random = std::collections::hash_map::RandomState::new().build_hasher().finish();
+        format!("v{:014x}", random & 0xff_ffff_ffff_ffff)
+    };
+    // A thread of ours carries it while we look.
+    let (named, done) = (std::sync::mpsc::channel::<()>(), std::sync::mpsc::channel::<()>());
+    let carrier = {
+        let name = wide(&name);
+        std::thread::spawn(move || {
+            // SAFETY: this thread's own description, a NUL-terminated name.
+            unsafe { SetThreadDescription(GetCurrentThread(), name.as_ptr()) };
+            let _ = named.0.send(());
+            let _ = done.1.recv();
+        })
+    };
+    let _ = named.1.recv();
+    let ours = processes.into_iter().find(|process| {
+        numbers(&format!(r"\\?\unix\proc\{process}\task\*")).into_iter().any(|thread| {
+            let path = format!(r"\\?\unix\proc\{process}\task\{thread}\comm");
+            std::fs::read(path).is_ok_and(|comm| comm.strip_suffix(b"\n").unwrap_or(&comm) == name.as_bytes())
+        })
+    });
+    let _ = done.0.send(());
+    let _ = carrier.join();
+    if ours.is_none() {
+        tracing::info!("our Linux process not found by thread name: blocks open before their bytes");
+    }
+    ours
 }
 
 /// Writes `len` bytes at `src` to `file` at offset `at`.
