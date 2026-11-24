@@ -31,3 +31,24 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+
+  # The crates that do not need the Windows host build and test on Linux too,
+  # so a change to them is checked on both and can be worked on without
+  # Windows. victory-gpu builds here and runs its host-independent tests; it
+  # is left out of clippy because code used only by the Windows host shows
+  # as unused.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PORTABLE: >-
+        -p victory-core -p victory-pe -p victory-formats -p victory-shader
+        -p victory-pipeline -p victory-game -p xtask
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy, portable crates
+        run: cargo clippy $PORTABLE --all-targets --locked -- -D warnings
+      - name: Tests, portable crates and victory-gpu
+        run: cargo test $PORTABLE -p victory-gpu --locked
