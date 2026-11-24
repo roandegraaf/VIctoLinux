@@ -231,6 +231,44 @@ pub(crate) fn avoided(bytes: usize) {
     add(S::Avoided, bytes as u64);
 }
 
+/// The diagnostics line: per frame over `frames` frames, then the census.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log(frames: f64) {
+    if !enabled() {
+        return;
+    }
+    let take = |s: S| STATS[s as usize].swap(0, Relaxed) as f64 / frames;
+    let mb = |v: f64| v / 1e6;
+    let (ever, touched) = (STATS[S::EverOwned as usize].load(Relaxed), STATS[S::EverTouched as usize].load(Relaxed));
+    tracing::info!(
+        "lazy copy-back per frame: {:.1} ranges {:.2} MB made GPU-owned in {:.2} ms; {:.2} MB of \
+         copy-back avoided; {:.1} CPU touches {:.2} MB copied back in {:.2} ms; {:.1} blocks {:.2} MB \
+         given back for our own use; {:.2} MB read from the owning copy; {:.1} dropped by remap or \
+         free, {:.1} lost; not taken: {:.2} MB unwatched (views), {:.2} MB resting, {:.2} MB \
+         written by the title; now {:.1} MB owned. Census: {:.1} MB ever GPU-owned, the CPU \
+         touched {:.1} MB of it ({:.1} %)",
+        take(S::Runs),
+        mb(take(S::Bytes)),
+        take(S::TakeUs) / 1e3,
+        mb(take(S::Avoided)),
+        take(S::Touches),
+        mb(take(S::TouchBytes)),
+        take(S::FaultUs) / 1e3,
+        take(S::Released),
+        mb(take(S::ReleasedBytes)),
+        mb(take(S::Served)),
+        take(S::Dropped),
+        take(S::Lost),
+        mb(take(S::Unwatched)),
+        mb(take(S::Resting)),
+        mb(take(S::Written)),
+        (HELD.load(Relaxed) * BLOCK) as f64 / 1e6,
+        ever as f64 / 1e6,
+        touched as f64 / 1e6,
+        if ever == 0 { 0.0 } else { touched as f64 * 100.0 / ever as f64 },
+    );
+}
+
 /// Whether any block is owned.
 pub(crate) fn any() -> bool {
     HELD.load(Relaxed) != 0
