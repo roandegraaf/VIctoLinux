@@ -51,6 +51,42 @@ scripts/proton-run.sh run /path/to/game/<the title's exe> --execute
 With an Xbox controller connected, the keyboard is not a pad (as on
 Windows), so `VICTORY_KEYS` presses do not reach the title either.
 
+### Without Proton (system Wine)
+
+A system Wine works too (reported with Wine 11.22 on RDNA2, RDNA3 and
+RDNA 3.5). What Proton brings has to be added:
+
+- **vkd3d-proton 3.2 or newer**: `d3d12.dll` and `d3d12core.dll` (Proton
+  Experimental's `files/lib/wine/vkd3d-proton/x86_64-windows`). 3.1 turns
+  some translated shaders into SPIR-V RADV cannot take.
+- **DXVK's `dxgi.dll`**, and `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n"`.
+- No Microsoft `d3dcompiler_47`: Wine's built-in one compiles the argument
+  clamp since it no longer needs `RWByteAddressBuffer` methods.
+
+### Diagnostics switches
+
+In the diagnostics build:
+
+- `VICTORY_NO_WATCHDOG=1` (from #454, if merged) keeps the title's stall
+  watchdog from ending slow runs.
+- `VICTORY_SHOW_TARGET=<w>x<h>-f<format>[-<n>]` presents an intermediate
+  render target instead of the final frame, the `n`th of that size and
+  format the frame writes (names as in `VICTORY_DUMP_TARGETS` files). The
+  world's G-buffer shows its geometry while the final image is dark:
+  `VICTORY_SHOW_TARGET=2560x1440-f28-3` on a Series X profile.
+- `VICTORY_DEBUG_PS=1` draws depth-tested geometry with a debug pixel
+  shader (surfaces coloured by their slope, from depth derivatives) instead
+  of the title's: the geometry of every draw whose vertex or mesh stage
+  translates, whether its pixel shader does or not. With the two switches
+  together you can walk the world in a flat-colour view.
+
+In every build, a draw of depth-tested geometry whose pixel shader does
+not translate (or that the host refuses) is drawn with that debug shader
+instead of dropped; `VICTORY_PS_FALLBACK=0` turns that off.
+`VICTORY_PIPELINE_WAIT_MS` sets how long a frame may wait for pipelines
+being made (500 by default; 0 never waits, pipelines then appear a few
+frames later).
+
 ## Tests
 
 ```sh
@@ -66,8 +102,11 @@ and `policy::tests::repository_passes_policy` (runs `git`). Run
 ## Known differences
 
 - **Speed.** Wine emulates write watching page by page, so the copies of
-  title memory take longer than on Windows; under Wine each range is asked
-  of the kernel once per submission (`watch::new_submission`).
+  title memory take longer than on Windows. Under Wine the kernel is asked
+  about each title allocation once per submission (`watch::new_submission`),
+  views of physical pages go straight to their guards, and allocations are
+  looked up from a cache rather than with `VirtualQuery`, which takes the
+  same lock as the title's write faults.
 - **Software rendering does not work.** On lavapipe, Wine cannot handle the
   write faults of VIctory's guarded title memory when lavapipe's own
   threads take them.
