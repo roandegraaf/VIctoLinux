@@ -592,7 +592,7 @@ mod host {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test here needs Windows paths
 mod tests {
     use super::*;
 

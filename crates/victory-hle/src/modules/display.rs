@@ -4,8 +4,10 @@
 
 use std::ffi::{c_char, c_void};
 
+#[cfg(windows)]
+use super::xgameruntime::put;
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, text,
 };
 
 /// HDR mode; asked for with this interface id since 2020.

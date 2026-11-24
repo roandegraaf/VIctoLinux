@@ -7,8 +7,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use offhost::{Host, Validator, host};
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -668,4 +673,64 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Off Windows there is neither `dxil.dll` nor a host D3D12 device:
+/// `--validate`, `--pipelines` and `VICTORY_PAIRS` say so and stop, and
+/// translation alone still runs. Neither type can be made, so the methods
+/// are never reached.
+#[cfg(not(windows))]
+mod offhost {
+    use std::path::{Path, PathBuf};
+
+    use victory_shader::emit::HostShader;
+
+    pub enum Validator {}
+
+    impl Validator {
+        pub fn default_path() -> Option<PathBuf> {
+            None
+        }
+
+        pub fn load(_: Option<&Path>) -> Result<Self, String> {
+            Err("DXIL validation needs Windows (dxil.dll)".into())
+        }
+
+        pub fn validate(&mut self, _: &mut [u8]) -> Result<(), String> {
+            match *self {}
+        }
+    }
+
+    pub enum Host {}
+
+    impl Host {
+        pub fn new(_warp: bool) -> Result<Self, String> {
+            Err("creating pipelines needs the Windows host's D3D12".into())
+        }
+
+        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+    }
+
+    pub mod host {
+        use victory_shader::emit::HostShader;
+
+        /// Only asked for alongside a [`super::Host`], which cannot exist.
+        pub fn stub_ps() -> HostShader {
+            unreachable!("no host off Windows")
+        }
+
+        pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
+            Err("no host off Windows".into())
+        }
+    }
 }

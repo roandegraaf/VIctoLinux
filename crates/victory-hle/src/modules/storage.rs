@@ -172,7 +172,7 @@ static VTABLE: Methods<8> = Methods([
     prompt_result as *const (),    // 0x38
 ]);
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test here needs Windows paths
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;

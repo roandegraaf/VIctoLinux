@@ -173,7 +173,7 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test here reads the test binary as a PE image
 mod tests {
     use super::*;
 
@@ -241,7 +241,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_assigns_static_tls_to_a_prepared_dll() {
         // Model a title DLL using our own linked image. Loading a DLL leaves

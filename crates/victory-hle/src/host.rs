@@ -84,6 +84,7 @@ impl HostPolicy {
 
 /// The host's own `name` from the System32 DLL `dll`: what a title import
 /// of it is bound to when we do not override it.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn function(dll: &str, name: &str) -> Option<usize> {
     let name = ImportSymbol::Name {
         hint: 0,
