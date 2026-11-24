@@ -32,6 +32,7 @@ pub const TLS64_ADDRESS_OF_CALLBACKS: usize = 24;
 
 /// Data directory indices.
 pub mod dir {
+    pub const EXPORT: usize = 0;
     pub const IMPORT: usize = 1;
     pub const EXCEPTION: usize = 3;
     pub const BASERELOC: usize = 5;

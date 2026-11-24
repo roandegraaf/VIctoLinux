@@ -405,12 +405,16 @@ fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
 mod tests {
     use super::*;
 
-    /// The test binary itself is a real MSVC-linked PE32+ image.
+    /// The test binary itself is a real MSVC-linked PE32+ image (on Windows
+    /// only: elsewhere it is ELF or Mach-O, and the tests that need it are
+    /// left out; the synthetic images below cover the same checks).
+    #[cfg(windows)]
     fn own_image() -> Vec<u8> {
         std::fs::read(std::env::current_exe().unwrap()).unwrap()
     }
 
     #[test]
+    #[cfg(windows)]
     fn parses_own_test_binary() {
         let info = ImageInfo::parse(&own_image()).unwrap();
         assert_eq!(info.machine, MACHINE_AMD64);
@@ -430,6 +434,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn rva_to_file_offset_maps_entry_point() {
         let data = own_image();
         let info = ImageInfo::parse(&data).unwrap();
@@ -439,7 +444,7 @@ mod tests {
 
     #[test]
     fn rva_to_file_offset_rejects_offsets_past_4_gib() {
-        let mut info = ImageInfo::parse(&own_image()).unwrap();
+        let mut info = ImageInfo::parse(&import_image()).unwrap();
         let rva = info.sections[0].rva + 0x20;
         assert!(info.rva_to_file_offset(rva).is_some());
         // Used to overflow (a panic in debug builds, a wrong offset in
@@ -452,14 +457,14 @@ mod tests {
     fn rejects_garbage_without_panicking() {
         assert!(ImageInfo::parse(b"").is_err());
         assert!(ImageInfo::parse(b"MZ not really").is_err());
-        let mut truncated = own_image();
-        truncated.truncate(0x200);
+        let mut truncated = import_image();
+        truncated.truncate(0x100);
         assert!(ImageInfo::parse(&truncated).is_err());
     }
 
     #[test]
     fn rejects_iat_outside_image() {
-        let mut data = own_image();
+        let mut data = import_image();
         let dd = layout::data_directory_offset(&data, dir::IMPORT).unwrap();
         let import_rva = layout::read_u32(&data, dd).unwrap();
         let desc = ImageInfo::parse(&data)
@@ -476,6 +481,12 @@ mod tests {
     /// A minimal PE32+ image: one section at RVA 0x1000 holding `body`, with
     /// the export directory (RVA 0x1000, 0x80 bytes) pointing at it.
     fn synthetic_image(body: &[u8]) -> Vec<u8> {
+        synthetic_image_with(dir::EXPORT, b".edata", body)
+    }
+
+    /// As [`synthetic_image`], with data directory `directory` (RVA 0x1000,
+    /// 0x80 bytes) pointing at the section, which is named `section`.
+    fn synthetic_image_with(directory: usize, section: &[u8], body: &[u8]) -> Vec<u8> {
         let mut d = vec![0u8; 0x200];
         d[0..2].copy_from_slice(b"MZ");
         d[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
@@ -492,10 +503,11 @@ mod tests {
         d[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes());
         d[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
         d[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
-        d[opt + 112..opt + 116].copy_from_slice(&0x1000u32.to_le_bytes());
-        d[opt + 116..opt + 120].copy_from_slice(&0x80u32.to_le_bytes());
+        let dd = opt + 112 + 8 * directory;
+        d[dd..dd + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[dd + 4..dd + 8].copy_from_slice(&0x80u32.to_le_bytes());
         let sec = opt + 240;
-        d[sec..sec + 6].copy_from_slice(b".edata");
+        d[sec..sec + section.len()].copy_from_slice(section);
         d[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes()); // virtual size
         d[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
         d[sec + 16..sec + 20].copy_from_slice(&0x200u32.to_le_bytes()); // raw size
@@ -503,6 +515,54 @@ mod tests {
         d.extend_from_slice(body);
         d.resize(0x400, 0);
         d
+    }
+
+    /// A synthetic DLL importing `kernel32.dll!ExitProcess` (hint 7): one
+    /// import descriptor at RVA 0x1000, its name table at 0x1040 and its IAT
+    /// at 0x1060.
+    fn import_image() -> Vec<u8> {
+        let mut body = vec![0u8; 0x100];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut body, 0, 0x1040); // OriginalFirstThunk (name table)
+        put32(&mut body, 12, 0x1080); // Name
+        put32(&mut body, 16, 0x1060); // FirstThunk (IAT)
+        // The descriptor at 0x14 stays zero: the end of the list.
+        body[0x40..0x48].copy_from_slice(&0x10A0u64.to_le_bytes());
+        body[0x60..0x68].copy_from_slice(&0x10A0u64.to_le_bytes());
+        body[0x80..0x8D].copy_from_slice(b"kernel32.dll\0");
+        body[0xA0..0xA2].copy_from_slice(&7u16.to_le_bytes());
+        body[0xA2..0xAE].copy_from_slice(b"ExitProcess\0");
+        synthetic_image_with(dir::IMPORT, b".idata", &body)
+    }
+
+    #[test]
+    fn parses_synthetic_imports() {
+        let info = ImageInfo::parse(&import_image()).unwrap();
+        assert_eq!(info.machine, MACHINE_AMD64);
+        assert!(info.is_dll());
+        assert!(info.sections.iter().any(|s| s.name == ".idata"));
+        assert_eq!(info.imports.len(), 1);
+        let kernel32 = &info.imports[0];
+        assert_eq!(kernel32.dll, "kernel32.dll");
+        assert_eq!(kernel32.entries.len(), 1);
+        assert_eq!(kernel32.entries[0].iat_slot_rva, 0x1060);
+        assert_eq!(
+            kernel32.entries[0].symbol,
+            ImportSymbol::Name {
+                hint: 7,
+                name: "ExitProcess".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rva_to_file_offset_maps_into_the_section() {
+        let info = ImageInfo::parse(&import_image()).unwrap();
+        assert_eq!(info.rva_to_file_offset(0x1000), Some(0x200));
+        assert_eq!(info.rva_to_file_offset(0x10A2), Some(0x2A2));
+        // Headers and the space past the section's data map to nothing.
+        assert_eq!(info.rva_to_file_offset(0x3000), None);
     }
 
     #[test]
