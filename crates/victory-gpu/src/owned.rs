@@ -676,26 +676,32 @@ fn through() -> Option<isize> {
         let mut file = None;
         for process in processes {
             let path = wide(&format!(r"\\?\unix\proc\{process}\mem"));
-            // SAFETY: a NUL-terminated path; closed unless it is ours.
-            unsafe {
-                let handle = CreateFileW(
-                    path.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    0,
-                    std::ptr::null_mut(),
-                );
-                if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-                    continue;
-                }
-                let mut read = [0u8; 16];
-                if pread(handle as isize, page as usize, &mut read) && read == mark {
-                    file = Some(handle as isize);
-                    break;
-                }
-                CloseHandle(handle);
+            let open = |access: u32| {
+                // SAFETY: a NUL-terminated path.
+                let handle = unsafe {
+                    CreateFileW(
+                        path.as_ptr(),
+                        access,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                (handle != INVALID_HANDLE_VALUE && !handle.is_null()).then_some(handle)
+            };
+            // Others' are opened for reading only, and read at one place.
+            let Some(handle) = open(GENERIC_READ) else {
+                continue;
+            };
+            let mut read = [0u8; 16];
+            let ours = pread(handle as isize, page as usize, &mut read) && read == mark;
+            // SAFETY: a handle we opened.
+            unsafe { CloseHandle(handle) };
+            if ours {
+                file = open(GENERIC_WRITE).map(|h| h as isize);
+                break;
             }
         }
         // Ours: does it write a closed page?
@@ -749,14 +755,22 @@ fn pwrite(file: isize, at: usize, src: *const u8, len: usize) -> bool {
 /// Writes `len` bytes at `src` into title memory at `dst` while its pages
 /// are closed; false if that cannot be done here.
 fn fill(dst: usize, src: *const u8, len: usize) -> bool {
+    #[cfg(test)]
+    if ACCESS_FIRST.load(Relaxed) {
+        return false;
+    }
     len == 0 || through().is_some_and(|file| pwrite(file, dst, src, len))
 }
+
+/// For tests: closed pages take no write, as on Windows itself.
+#[cfg(test)]
+static ACCESS_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a block goes back to the title with its bytes before it opens
 /// (see the module's notes).
 #[cfg(test)]
 pub(crate) fn fills_closed() -> bool {
-    through().is_some()
+    !ACCESS_FIRST.load(Relaxed) && through().is_some()
 }
 
 /// Before we read or write title memory `[at, at + len)` in a way that
@@ -799,15 +813,25 @@ pub(crate) fn release_others(id: usize, from: usize, to: usize) -> Vec<usize> {
 
 /// Title memory `[at, at + len)` is unmapped, remapped or freed: blocks
 /// owned there are the title's again without their bytes (what it freed
-/// needs none), and their history is forgotten.
+/// needs none), and their history is forgotten. A block only part of which
+/// is in the range goes back with its bytes: the rest of it stays.
 pub(crate) fn forget(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if !any() && KNOWN.load(Relaxed) == 0 {
         return;
     }
-    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let end = at.saturating_add(len);
+    let range = at.div_ceil(BLOCK)..end / BLOCK;
     let mut state = lock();
     let state = &mut *state;
+    for edge in [at / BLOCK, end / BLOCK] {
+        if !range.contains(&edge) && edge * BLOCK < end {
+            give_back(state, edge, Why::Ours);
+        }
+    }
+    if range.is_empty() {
+        return;
+    }
     let blocks: Vec<usize> = state.blocks.range(range.clone()).map(|(&b, _)| b).collect();
     for block in blocks {
         if let Some(held) = state.blocks.remove(&block) {
@@ -1088,8 +1112,11 @@ mod tests {
         fn drop(&mut self) {
             forget(self.at, self.blocks * BLOCK);
             crate::watch::title_memory_remapped(self.at, self.blocks * BLOCK);
+            // Decommitted, not released: the watch's journal has entries
+            // for these pages, which another test given the address would
+            // see.
             // SAFETY: our allocation.
-            unsafe { VirtualFree(self.at as *mut _, 0, MEM_RELEASE) };
+            unsafe { VirtualFree(self.at as *mut _, 0, MEM_DECOMMIT) };
         }
     }
 
@@ -1310,6 +1337,62 @@ mod tests {
         // SAFETY: as above.
         unsafe { VirtualAlloc((title.at + 2 * BLOCK) as *const _, BLOCK, MEM_COMMIT, PAGE_READWRITE) };
         assert_eq!(title.read(2 * BLOCK), 0);
+        // The title decommits one page of a block: the rest of the block
+        // is still its memory, and gets the GPU's bytes.
+        let dropped = stat(S::Dropped);
+        crate::title_memory_decommitted(title.at + 3 * BLOCK + 4096, 4096);
+        assert_eq!(title.held(), [0]);
+        assert_eq!(stat(S::Dropped), dropped);
+        assert_eq!((title.read(3 * BLOCK), title.read(4 * BLOCK - 1)), (2, 2));
+        assert_eq!(stat(S::Touches), touches);
+        // A range from the middle of one block to the middle of another.
+        let wide = Title::new(4, 1, 2);
+        assert_eq!(wide.take(), [0, 1, 2, 3]);
+        crate::title_memory_decommitted(wide.at + BLOCK / 2, 2 * BLOCK);
+        assert_eq!(wide.held(), [3]);
+        assert_eq!((wide.read(0), wide.read(BLOCK), wide.read(3 * BLOCK - 1)), (2, 1, 2));
+        assert_eq!(stat(S::Dropped) - dropped, 1);
+        assert_eq!(stat(S::Touches), touches);
+    }
+
+    /// The order Windows itself has (a closed page takes no write there):
+    /// access, then the bytes. One thread at a time it gives the same.
+    #[test]
+    fn access_first_gives_the_same_to_one_thread() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ACCESS_FIRST.store(false, Relaxed);
+            }
+        }
+        let _on = force(true);
+        let _reset = Reset;
+        ACCESS_FIRST.store(true, Relaxed);
+        assert!(!fills_closed());
+        let title = Title::new(3, 1, 2);
+        assert_eq!(title.take(), [0, 1, 2]);
+        let touches = stat(S::Touches);
+        assert_eq!(title.read(100), 2);
+        title.write(BLOCK + 1, 9);
+        assert_eq!((title.read(BLOCK), title.read(BLOCK + 1)), (2, 9));
+        assert_eq!(stat(S::Touches) - touches, 2);
+        // While shaders may write the copy.
+        let (id, first) = (title.source().id, title.first());
+        assert_eq!(begin_writes(id, title.at, title.at + 3 * BLOCK), [first + 2]);
+        assert_eq!(title.read(3 * BLOCK - 1), 2);
+        let (kept, saved) = settle(id, first, first + 3);
+        assert!(kept.is_empty());
+        assert!(saved.len() == 1 && saved[0].at == title.at + 2 * BLOCK && saved[0].bytes == [2; BLOCK]);
+        // Memory gone without a word is still found gone.
+        title.copied();
+        title.submissions(64);
+        assert_eq!(title.take(), [0, 1, 2]);
+        let lost = stat(S::Lost);
+        // SAFETY: a block of our allocation.
+        assert_ne!(unsafe { VirtualFree(title.at as *mut _, BLOCK, MEM_DECOMMIT) }, 0);
+        release(title.at, BLOCK);
+        assert_eq!(stat(S::Lost) - lost, 1);
+        assert_eq!(title.held(), [1, 2]);
     }
 
     /// The alias policy: views of a section (xmem's physical pages, which

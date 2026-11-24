@@ -326,7 +326,7 @@ What it does not do, and why:
 | Our own kernel writes, kernel reads for our records, texture and descriptor-heap refreshes (which rely on the write watch), another copy's refresh | the block is given back first |
 | The title's `ReadFile`, `fread`, DirectStorage destinations, `WriteFile`, `fwrite` | given back first (`kernel_will_write`, `title_will_touch`) |
 | The title's `VirtualAlloc` over owned pages (resets their protection), `VirtualProtect`, `XMemVirtualAlloc` at an address | given back first |
-| `VirtualFree`, `XMemFreeDefault`, xmem's map and unmap | ownership dropped, nothing copied; a block found gone when it is to be given back is dropped and counted ("lost") |
+| `VirtualFree`, `XMemFreeDefault`, xmem's map and unmap | ownership dropped, nothing copied; a block only part of which is freed is given back with its bytes; a block found gone when it is to be given back is dropped and counted ("lost") |
 | Bottom-of-pipe writes, ranges written through two copies in one submission | their blocks are not taken |
 
 Known gaps:
@@ -340,8 +340,9 @@ Known gaps:
 - **Under Wine** the bytes land first: the Linux kernel's file of the
   process's memory (`/proc/<pid>/mem`) writes closed pages. Wine's server
   opens files, so `/proc/self` is the server; our own process is found
-  once by reading a marked page of ours through each process's file (only
-  ours is ever written). If the kernel or the container refuses
+  once: `/proc` is listed and each process's file the server may open is
+  opened for reading and read at the address of a marked page of ours
+  (16 bytes); only ours is then opened for writing. If the kernel or the container refuses
   (`proc_mem.force_override`, ptrace limits) the Windows order is used; the
   log says which ("title memory through the kernel's file of it").
 - Other host calls that hand title memory to the kernel (sockets,

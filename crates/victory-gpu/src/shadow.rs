@@ -712,7 +712,7 @@ mod tests {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::s;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE,
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualQuery,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
@@ -886,8 +886,11 @@ void main(uint3 id : SV_DispatchThreadID) {
             unregister(self.at, self.at as u64);
             crate::title_memory_remapped(self.at, self.blocks * PAGE);
             if !self.view {
+                // Decommitted, not released: the watch's journal has
+                // entries for these pages, which another test given the
+                // address would see. (Views stay mapped for the same.)
                 // SAFETY: our allocation.
-                unsafe { VirtualFree(self.at as *mut _, 0, MEM_RELEASE) };
+                unsafe { VirtualFree(self.at as *mut _, 0, MEM_DECOMMIT) };
             }
         }
     }
@@ -1078,9 +1081,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// every view of it.
     #[test]
     fn views_keep_the_copy_back() {
-        use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
-        };
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
         let _on = crate::owned::force(true);
         if host().is_none() {
             return; // no host GPU here
@@ -1112,12 +1113,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         b.add_all(1000);
         assert_eq!(b.word(5), 2005);
         assert_eq!(stat(S::Touches), touches);
-        drop(b);
-        // SAFETY: our views.
-        unsafe {
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: alias as *mut _ });
-        }
     }
 
     /// A partly committed title buffer: its unmapped block is never taken,
