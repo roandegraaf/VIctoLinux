@@ -34,6 +34,15 @@ pub(crate) struct GraphicsState {
     samples: DXGI_SAMPLE_DESC,
 }
 
+impl GraphicsState {
+    /// Whether this draws depth-tested geometry (the 3D scene), not flat
+    /// layers (interface, full-screen passes), which keep their own pixel
+    /// shaders in the debug view.
+    pub(crate) fn draws_geometry(&self) -> bool {
+        self.depth_format != DXGI_FORMAT_UNKNOWN && self.depth.DepthEnable.as_bool()
+    }
+}
+
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
@@ -277,6 +286,29 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
+/// `VICTORY_DEBUG_PS=1`: graphics pipelines that draw depth-tested
+/// geometry draw with our debug pixel shader ([`victory_shader::emit::debug_ps`]), surfaces coloured by their
+/// slope, instead of the title's: the geometry of every draw whose vertex
+/// or mesh stage translates, lit or not, its pixel shader translated or not.
+pub(crate) fn debug_ps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DEBUG_PS").is_some();
+        if on {
+            tracing::info!("graphics pipelines draw with the debug pixel shader (VICTORY_DEBUG_PS)");
+        }
+        on
+    })
+}
+
+/// Whether geometry whose pixel shader does not translate (or is refused)
+/// is drawn with the debug pixel shader instead of dropped: on unless
+/// `VICTORY_PS_FALLBACK=0`.
+fn ps_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PS_FALLBACK").map_or(true, |v| v != "0"))
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -290,8 +322,35 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
-    /// state `g`, or for one compute shader.
+    /// state `g`, or for one compute shader. A pipeline drawing depth-tested
+    /// geometry falls back to our debug pixel shader where the title's does
+    /// not translate or the host refuses it (and, in the debug view, to the
+    /// title's where ours is refused), so its geometry is drawn rather than
+    /// dropped (`VICTORY_PS_FALLBACK=0` turns that off).
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        let geometry = g.is_some_and(GraphicsState::draws_geometry)
+            && shaders.iter().any(|s| s.stage == "pixel");
+        if !geometry {
+            return Self::make(shaders, g, false);
+        }
+        let first = debug_ps();
+        if let Some(p) = Self::make(shaders, g, first) {
+            return Some(p);
+        }
+        if !first && !ps_fallback() {
+            return None;
+        }
+        let p = Self::make(shaders, g, !first)?;
+        if !first {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!("pixel shaders that do not translate are replaced by the debug one"));
+        }
+        Some(p)
+    }
+
+    /// [`HostPipeline::new`] with our debug pixel shader (`debug`) or the
+    /// title's.
+    fn make(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, debug: bool) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -317,7 +376,11 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            // Debug view: the title's pixel shader is left out (it need not
+            // translate) and ours stands in at the pixel slot.
+            if !debug {
+                stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            }
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -441,7 +504,18 @@ impl HostPipeline {
                 return None;
             }
         };
+        // The debug view's pixel shader, one output per colour target.
+        let debug = (compute.is_none() && debug)
+            .then(|| victory_shader::emit::debug_ps(g.map_or(1, |g| g.targets.NumRenderTargets)));
         let code = |i: usize| {
+            if i == 1
+                && let Some(d) = &debug
+            {
+                return D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: d.dxil.as_ptr().cast(),
+                    BytecodeLength: d.dxil.len(),
+                };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
