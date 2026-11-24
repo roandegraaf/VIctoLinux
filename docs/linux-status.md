@@ -309,8 +309,8 @@ before the submission (a snapshot), compared after it, and what differs is
 written back into title memory, read or not. With it, a 64 KiB block of such
 a range is not copied back: the host copy is the block's only current
 holder, the title's pages are `PAGE_NOACCESS`, and refreshes skip the block.
-The title's first access (read or write) faults; the handler restores
-access, writes the copy's 64 KiB into the block, and the block is the
+The title's first access (read or write) faults; the handler writes the
+copy's 64 KiB into the block, restores access, and the block is the
 title's again. The GPU using it again before that costs nothing: no
 snapshot, no comparison, no refresh, no write-watch asking.
 
@@ -331,22 +331,34 @@ What it does not do, and why:
 
 Known gaps:
 
-- Giving a block back is not atomic for the title's other threads: between
-  the protection change and the write of the 64 KiB another thread reads
-  older bytes, or loses a write of its own. Private memory has no second
-  view to fill it through.
+- **On Windows itself** giving a block back is not atomic for the title's
+  other threads: a closed page takes no write, so access comes first and
+  the 64 KiB after, and a thread using the block in between reads older
+  bytes or loses a write of its own. A test with 8 threads released on one
+  block failed that way once in four runs under Proton before the next
+  point.
+- **Under Wine** the bytes land first: the Linux kernel's file of the
+  process's memory (`/proc/<pid>/mem`) writes closed pages. Wine's server
+  opens files, so `/proc/self` is the server; our own process is found
+  once by reading a marked page of ours through each process's file (only
+  ours is ever written). If the kernel or the container refuses
+  (`proc_mem.force_override`, ptrace limits) the Windows order is used; the
+  log says which ("title memory through the kernel's file of it").
 - Other host calls that hand title memory to the kernel (sockets,
   overlapped I/O, `VirtualAlloc2`, `Nt…` calls bound to the host) fail on
   an owned block instead of faulting. None is known to get GPU memory.
-- Under Wine a touch costs a signal, two `VirtualProtect`-sized calls and
-  a 64 KiB kernel write (about 0.1 ms measured for the write alone).
+- Under Wine a touch costs a signal, two protection changes and a 64 KiB
+  write through the kernel: 43 µs in the handler per touch (debug build, 63
+  touches), the signal and exception dispatch not counted.
 
 Primitives measured under Proton Experimental (256 MiB, write-watched):
 a non-resetting `GetWriteWatch` over all of it 0.45 ms, over one block
 3.5 µs; `PAGE_NOACCESS` over all of it 19 ms, one block back 6 µs;
 `WriteProcessMemory` of 64 KiB 95 µs. `PAGE_NOACCESS` and back neither
 set nor lose write-watch bits; `VirtualAlloc(MEM_COMMIT)` over a closed
-page opens it.
+page opens it. A write through the kernel's file is reported by the write
+watch like any other, so a block given back is copied once more at its next
+refresh (the same bytes).
 
 The diagnostics build logs "lazy copy-back per frame": ranges and MB made
 GPU-owned, MB of copy-back avoided, CPU touches with MB and time, blocks
