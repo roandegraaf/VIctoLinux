@@ -1588,6 +1588,14 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        // Diagnostics: an intermediate target instead (VICTORY_SHOW_TARGET).
+        #[cfg(feature = "diagnostics")]
+        let shown = crate::capture::take_shown();
+        #[cfg(feature = "diagnostics")]
+        let (texture, state) = match &shown {
+            Some((copy, s)) => (&copy.texture, *s),
+            None => (texture, state),
+        };
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
