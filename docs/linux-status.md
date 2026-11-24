@@ -297,3 +297,60 @@ statistics line, this is why.
 
 The "copy path per frame" line shows the split: "N allocation lookups (R
 from records, W walked)". The rest were walked before and remembered.
+
+## GPU-owned title memory (stage 2, `VICTORY_LAZY_COPY_BACK=1`)
+
+Off by default; not yet measured in the world. Code:
+`crates/victory-gpu/src/owned.rs`, the `…_owned` paths of `shadow.rs`,
+`crates/victory-hle/src/modules/vmem.rs`.
+
+Without the switch, every range a submission's shaders may write is kept
+before the submission (a snapshot), compared after it, and what differs is
+written back into title memory, read or not. With it, a 64 KiB block of such
+a range is not copied back: the host copy is the block's only current
+holder, the title's pages are `PAGE_NOACCESS`, and refreshes skip the block.
+The title's first access (read or write) faults; the handler restores
+access, writes the copy's 64 KiB into the block, and the block is the
+title's again. The GPU using it again before that costs nothing: no
+snapshot, no comparison, no refresh, no write-watch asking.
+
+What it does not do, and why:
+
+| Case | Handling |
+|---|---|
+| Physical-page views (xmem's sections), the only memory with aliases (`map_alias`, `CopyPageMappingsBatchX`) | never owned: protecting one view leaves the others open, and views are not write-watched. They keep the copy-back. The line's "unwatched (views)" MB is how much that leaves |
+| Ranges far larger than what shaders write (views of the whole 174 MB heap, in which the title's threads write command memory meanwhile) | per block, not per range. A block is taken only if no write-watch bit is set before and after its pages are closed, and the copy is current by every write reported; else it is compared and copied back as before |
+| Memory the CPU works in | a touched block rests for 8 submissions, doubling with every touch up to 4096; a block found written at take time counts as touched |
+| The title touches a block while the submission that writes it runs | the block goes back with the copy's bytes of that moment, which are kept; after the submission what differs from them is merged into title memory. The handler never waits |
+| Our own reads (`copy_mapped`: buffer copies, uploads, another copy's first use) | served from the owning copy; the block stays owned |
+| Our own kernel writes, kernel reads for our records, texture and descriptor-heap refreshes (which rely on the write watch), another copy's refresh | the block is given back first |
+| The title's `ReadFile`, `fread`, DirectStorage destinations, `WriteFile`, `fwrite` | given back first (`kernel_will_write`, `title_will_touch`) |
+| The title's `VirtualAlloc` over owned pages (resets their protection), `VirtualProtect`, `XMemVirtualAlloc` at an address | given back first |
+| `VirtualFree`, `XMemFreeDefault`, xmem's map and unmap | ownership dropped, nothing copied; a block found gone when it is to be given back is dropped and counted ("lost") |
+| Bottom-of-pipe writes, ranges written through two copies in one submission | their blocks are not taken |
+
+Known gaps:
+
+- Giving a block back is not atomic for the title's other threads: between
+  the protection change and the write of the 64 KiB another thread reads
+  older bytes, or loses a write of its own. Private memory has no second
+  view to fill it through.
+- Other host calls that hand title memory to the kernel (sockets,
+  overlapped I/O, `VirtualAlloc2`, `Nt…` calls bound to the host) fail on
+  an owned block instead of faulting. None is known to get GPU memory.
+- Under Wine a touch costs a signal, two `VirtualProtect`-sized calls and
+  a 64 KiB kernel write (about 0.1 ms measured for the write alone).
+
+Primitives measured under Proton Experimental (256 MiB, write-watched):
+a non-resetting `GetWriteWatch` over all of it 0.45 ms, over one block
+3.5 µs; `PAGE_NOACCESS` over all of it 19 ms, one block back 6 µs;
+`WriteProcessMemory` of 64 KiB 95 µs. `PAGE_NOACCESS` and back neither
+set nor lose write-watch bits; `VirtualAlloc(MEM_COMMIT)` over a closed
+page opens it.
+
+The diagnostics build logs "lazy copy-back per frame": ranges and MB made
+GPU-owned, MB of copy-back avoided, CPU touches with MB and time, blocks
+given back for our own use, MB served from the owning copy, blocks dropped
+and lost, MB not taken (unwatched, resting, written by the title), MB owned
+now, and the census: MB ever GPU-owned and how much of it the CPU ever
+touched.

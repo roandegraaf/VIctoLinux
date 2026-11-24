@@ -106,6 +106,9 @@ frames later).
 `VICTORY_COPY_HOLES=0` stops the copies of title memory from remembering
 unmapped 64 KiB blocks (they are then read, failing, at every refresh, as
 before; for comparing).
+`VICTORY_LAZY_COPY_BACK=1` leaves what shaders wrote on the GPU until the
+title's CPU touches it (off by default; see "GPU-owned title memory" in
+[linux-status.md](linux-status.md)).
 
 ## Tests
 
