@@ -65,4 +65,7 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{
+    TitleMemory, title_memory_allocated, title_memory_freed, title_memory_record,
+    title_memory_remapped, title_view_mapped, title_view_unmapped, writing as kernel_will_write,
+};

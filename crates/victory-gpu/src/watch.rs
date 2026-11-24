@@ -26,6 +26,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
+mod records;
+pub use records::{
+    TitleMemory, title_memory_allocated, title_memory_freed, title_memory_record, title_view_mapped,
+    title_view_unmapped,
+};
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -66,7 +72,7 @@ fn on_wine() -> bool {
 }
 
 /// A title allocation as Wine reports it, in [`PAGE`] units.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Region {
     /// The allocation base, for dropping stale entries.
     base: usize,
@@ -78,7 +84,8 @@ struct Region {
     whole: bool,
 }
 
-/// The allocation holding `at`, cached by allocation base (walking an
+/// The allocation holding `at`: from the runtime's records of what it
+/// allocated ([`records`]), else cached by allocation base (walking an
 /// allocation's regions under Wine costs one VirtualQuery each). Those
 /// above 4 GiB are not asked about whole.
 fn allocation(at: usize) -> Option<Region> {
@@ -95,7 +102,11 @@ fn allocation(at: usize) -> Option<Region> {
 }
 
 fn allocation_now(at: usize) -> Option<Region> {
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if let Some(known) = records::find(at) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::RecordedAllocations, 1);
+        return known;
+    }
     let page = at / PAGE;
     // Known allocations first: under Wine VirtualQuery takes the same lock
     // the title's write faults do.
@@ -104,7 +115,28 @@ fn allocation_now(at: usize) -> Option<Region> {
     {
         return Some(r);
     }
+    let r = walk(at)?;
+    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    // An allocation that replaced older ones in its range.
+    regions.retain(|_, o| o.last <= r.first || o.first >= r.last);
+    regions.insert(r.first, r);
+    Some(r)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `VirtualQuery` calls [`walk`] made on this thread.
+    static QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The allocation holding `at`, as the host reports it: for memory the
+/// runtime did not allocate (the title's own `VirtualAlloc`, the host's
+/// heaps).
+fn walk(at: usize) -> Option<Region> {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let query = |p: usize| {
+        #[cfg(test)]
+        QUERIES.with(|n| n.set(n.get() + 1));
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
@@ -151,19 +183,21 @@ fn allocation_now(at: usize) -> Option<Region> {
     if r.first * PAGE > at || r.last <= r.first {
         return None;
     }
-    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-    // An allocation that replaced older ones in its range.
-    regions.retain(|_, o| o.last <= r.first || o.first >= r.last);
-    regions.insert(r.first, r);
     Some(r)
 }
 
-/// Allocations seen by [`allocation`], by first page. Remaps (xmem's views)
-/// and failed askings drop entries.
+/// Allocations [`walk`] found, by first page. Remaps (xmem's views) and
+/// failed askings drop entries.
 static REGIONS: Mutex<BTreeMap<usize, Region>> = Mutex::new(BTreeMap::new());
 
 fn forget_region(base: usize) {
     REGIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, r| r.base != base);
+    records::forget_watched(base);
+}
+
+/// Forgets the walked allocations with pages in `[first, last)`.
+fn forget_regions(first: usize, last: usize) {
+    REGIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, r| r.last <= first || r.first >= last);
 }
 
 /// A submission begins: memory asked about from now on is asked of the
@@ -521,8 +555,11 @@ pub fn writing(at: usize, len: usize) {
 /// shows is new and read-write, so it is no longer guarded, and a hole
 /// there may be none now (a new one is found by the next copy).
 pub fn title_memory_remapped(at: usize, len: usize) {
-    REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let blocks = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    // A remap changes the allocations it touches (the view, the
+    // placeholder it splits or returns to) and no other, so only what a
+    // walk found there is stale. (`BLOCK` is `PAGE`.)
+    forget_regions(blocks.start, blocks.end);
     mapped_now(holes_in(blocks.start, blocks.end));
     let mut g = guards();
     let blocks: Vec<usize> = g

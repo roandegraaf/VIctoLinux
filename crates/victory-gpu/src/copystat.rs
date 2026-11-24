@@ -49,9 +49,11 @@ pub(crate) enum C {
     /// is committed, and opening its guarded blocks.
     CommittedUs,
     WritingUs,
-    /// Under Wine: allocation lookups, those that walked the allocation's
-    /// regions, and the time in both.
+    /// Under Wine: allocation lookups, those answered from the runtime's
+    /// records, those that walked the allocation's regions (the rest were
+    /// walked before and remembered), and the time in all.
     Allocations,
+    RecordedAllocations,
     RegionWalks,
     AllocationUs,
     /// Write-watch askings answered from the journal (not in `Watches`).
@@ -171,7 +173,8 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "copy path per frame: {:.0} title copies {:.1} MB, {:.0} fills {:.1} MB; {:.0} merged \
          refreshes {:.2} ms; {:.0} failed reads, fallback walks {:.2} ms; title destinations: \
-         committed {:.2} ms, opening guards {:.2} ms; {:.0} allocation lookups ({:.0} walked) \
+         committed {:.2} ms, opening guards {:.2} ms; {:.0} allocation lookups ({:.0} from records, {:.0} \
+         walked) \
          {:.2} ms; {:.0} watches answered from the journal; holes: {} known, {:.0} zero-filled, \
          {:.0} kept from the guard, {:.0} probes {:.2} ms, {:.1} found, {:.1} mapped again",
         c[C::Copies as usize],
@@ -185,6 +188,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::CommittedUs as usize]),
         ms(c[C::WritingUs as usize]),
         c[C::Allocations as usize],
+        c[C::RecordedAllocations as usize],
         c[C::RegionWalks as usize],
         ms(c[C::AllocationUs as usize]),
         c[C::JournalHits as usize],
