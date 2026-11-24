@@ -1314,9 +1314,14 @@ impl Batch {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+///
+/// A read that fails is done again piece by piece, and the 64 KiB blocks
+/// found wholly unmapped are remembered ([`crate::watch::holes_in`]): the
+/// next copy over them reads around them.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     use crate::copystat::{C, add};
+    use crate::watch::PAGE;
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -1346,36 +1351,79 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         #[cfg(feature = "diagnostics")]
         add(C::WritingUs, started.elapsed().as_micros() as u64);
     }
-    #[cfg(feature = "diagnostics")]
-    let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
-    #[cfg(feature = "diagnostics")]
-    add(C::MoveUs, moved.elapsed().as_micros() as u64);
-    if !whole {
-        walk(dst, src as usize, len);
+    let (start, end) = (src as usize, src as usize + len);
+    // `[from, to)` of the source in one read, piece by piece if it fails.
+    let run = |from: usize, to: usize| {
+        let into = dst.wrapping_add(from - start);
+        #[cfg(feature = "diagnostics")]
+        let moved = std::time::Instant::now();
+        let whole = read(from as *const u8, into, to - from);
+        #[cfg(feature = "diagnostics")]
+        add(C::MoveUs, moved.elapsed().as_micros() as u64);
+        if !whole {
+            walk(into, from, to - from);
+        }
+    };
+    let holes = crate::watch::holes_in(start / PAGE, end.div_ceil(PAGE));
+    if holes.is_empty() {
+        return run(start, end);
+    }
+    // Around the known holes, which take zeros: one read per mapped run,
+    // where the whole read would fail and the walk after it would read
+    // the mapped pieces a second time and each hole 17 times.
+    let mut at = start;
+    for block in holes {
+        if !crate::watch::still_hole(block) {
+            continue; // mapped since: read with its neighbours
+        }
+        let (from, to) = ((block * PAGE).max(start), ((block + 1) * PAGE).min(end));
+        if at < from {
+            run(at, from);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::HolesFilled, 1);
+            add(C::Unmapped, (to - from) as u64);
+        }
+        // SAFETY: inside the destination, which is mapped.
+        unsafe { dst.wrapping_add(from - start).write_bytes(0, to - from) };
+        at = to;
+    }
+    if at < end {
+        run(at, end);
     }
 }
 
 /// Copies `len` bytes of title memory at `src` into `dst` after a read of
 /// them failed: something is unmapped, so page by page (64 KiB, then 4 KiB
-/// in a piece that fails), zeros for what cannot be read.
+/// in a piece that fails), zeros for what cannot be read. A whole 64 KiB
+/// block with no readable page is remembered as a hole.
 fn walk(dst: *mut u8, src: usize, len: usize) {
+    use crate::watch::PAGE;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    for_pieces(src, len, 64 << 10, |at, n| {
+    for_pieces(src, len, PAGE, |at, n| {
         let to = dst.wrapping_add(at - src);
         if !read(at as *const u8, to, n) {
+            let mut mapped = false;
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src);
-                if !read(at as *const u8, to, n) {
+                if read(at as *const u8, to, n) {
+                    mapped = true;
+                } else {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
                     unsafe { to.write_bytes(0, n) };
                 }
             });
+            // A piece of `PAGE` bytes is a whole block (pieces are cut at
+            // its multiples).
+            if !mapped && n == PAGE {
+                crate::watch::note_hole(at / PAGE);
+            }
         }
     });
     #[cfg(feature = "diagnostics")]
@@ -1394,19 +1442,48 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    let read = read_quietly(src, dst, len);
+    if !read {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::FailedReads, 1);
+        #[cfg(test)]
+        FAILED_READS.with(|n| n.set(n.get() + 1));
+    }
+    read
+}
+
+/// [`read`] without counting a failure.
+fn read_quietly(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    let read = unsafe {
-        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
-    };
+    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+}
+
+/// Whether the page at `at` can be read: one read of one byte.
+pub(crate) fn readable(at: usize) -> bool {
+    let mut byte = 0u8;
     #[cfg(feature = "diagnostics")]
-    if !read {
-        crate::copystat::add(crate::copystat::C::FailedReads, 1);
+    let started = std::time::Instant::now();
+    let read = read_quietly(at as *const u8, &mut byte, 1);
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::HoleProbes, 1);
+        add(C::HoleProbeUs, started.elapsed().as_micros() as u64);
     }
+    #[cfg(test)]
+    PROBES.with(|n| n.set(n.get() + 1));
     read
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Reads that failed on this thread, and probes made ([`readable`]).
+    pub(crate) static FAILED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Copies host memory into title memory after a submission (what shaders

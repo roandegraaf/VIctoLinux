@@ -41,8 +41,8 @@ pub(crate) enum C {
     /// Copies of title memory into a list's upload memory.
     Fills,
     FillBytes,
-    /// Reads that failed, and the time in the piece-by-piece walk after
-    /// one.
+    /// Reads that failed (probes of known holes apart), and the time in the
+    /// piece-by-piece walk after one.
     FailedReads,
     FallbackUs,
     /// Of copies into title memory: the time asking whether the destination
@@ -60,6 +60,16 @@ pub(crate) enum C {
     /// listed below).
     Updates,
     UpdateUs,
+    /// Known holes: blocks zero-filled without a failing walk, blocks the
+    /// guard no longer reports written, the one-byte reads that re-checked
+    /// them and their time, blocks newly found, and blocks found mapped
+    /// again.
+    HolesFilled,
+    HolesQuiet,
+    HoleProbes,
+    HoleProbeUs,
+    HolesFound,
+    HolesMapped,
     /// Not a counter: their number.
     Count,
 }
@@ -153,13 +163,14 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexChanged as usize]),
     );
     // Where the copy time goes. Moves (above; the reads of whole runs), the
-    // walks, committed and opening guards do not overlap, and are all
-    // inside the refreshes, copies and fills.
+    // walks, the probes, committed and opening guards do not overlap, and
+    // are all inside the refreshes, copies and fills.
     tracing::info!(
         "copy path per frame: {:.0} title copies {:.1} MB, {:.0} fills {:.1} MB; {:.0} merged \
          refreshes {:.2} ms; {:.0} failed reads, fallback walks {:.2} ms; title destinations: \
          committed {:.2} ms, opening guards {:.2} ms; {:.0} allocation lookups ({:.0} walked) \
-         {:.2} ms; {:.0} watches answered from the journal",
+         {:.2} ms; {:.0} watches answered from the journal; holes: {} known, {:.0} zero-filled, \
+         {:.0} kept from the guard, {:.0} probes {:.2} ms, {:.1} found, {:.1} mapped again",
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
         c[C::Fills as usize],
@@ -174,6 +185,13 @@ pub(crate) fn log(frames: f64) {
         c[C::RegionWalks as usize],
         ms(c[C::AllocationUs as usize]),
         c[C::JournalHits as usize],
+        crate::watch::holes_known(),
+        c[C::HolesFilled as usize],
+        c[C::HolesQuiet as usize],
+        c[C::HoleProbes as usize],
+        ms(c[C::HoleProbeUs as usize]),
+        c[C::HolesFound as usize],
+        c[C::HolesMapped as usize],
     );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
@@ -191,5 +209,19 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The counters are indexed by hand in the lines: the last one has a
+    /// slot, and the lines format.
+    #[test]
+    fn the_lines_take_every_counter() {
+        add(C::HolesMapped, 1);
+        range(0x1_0000, 16, 1, 0);
+        log(1.0);
     }
 }
