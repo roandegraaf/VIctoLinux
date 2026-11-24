@@ -39,6 +39,8 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(all(test, windows))]
+mod inplace_probe;
 pub mod list;
 pub mod object;
 pub mod pipeline;

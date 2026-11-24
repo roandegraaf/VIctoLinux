@@ -167,3 +167,58 @@ The order instead:
    stays the Windows build.
 
 Re-measure after each change with the statistics lines above.
+
+## Unified memory: can the GPU use title memory in place? (probe, 2026-11-24)
+
+The Xbox shares one memory pool between CPU and GPU. VIctory instead keeps
+host GPU copies of title memory and keeps them up to date. A synthetic
+probe answered whether the GPU can use title memory in place on this
+machine (`crates/victory-gpu/src/inplace_probe.rs`, ignored tests, no title
+data). Setup: RX 7900 XT, vkd3d-proton 3.2.0 `cae8353`, Proton
+Experimental.
+
+Opening title memory as a D3D12 heap (`OpenExistingHeapFromAddress*`):
+
+| Memory | Result |
+|---|---|
+| `VirtualAlloc` (with or without `MEM_WRITE_WATCH`), 64 MB to 8 GB, and page-aligned sub-ranges | **in place**: both ways, no copies, no 4 GiB ceiling |
+| Any section view (`MapViewOfFile`, `MapViewOfFile3` into a placeholder, as xmem's physical pages), and `OpenExistingHeapFromFileMapping` | `S_OK`, but **not in place** |
+| A reservation with only part committed | `E_INVALIDARG` |
+
+Why sections fail: vkd3d-proton asks RADV to import the memory, and the
+amdgpu kernel driver only takes anonymous memory (`AMDGPU_GEM_USERPTR_ANONONLY`).
+Wine's sections are shared file mappings. vkd3d-proton then falls back to
+memory of its own and still returns `S_OK`. Any use of this must be checked
+by a round trip, never by the HRESULT.
+
+Two more constraints:
+- Placed buffers in such a heap need `ALLOW_CROSS_ADAPTER`.
+- Write watch stops being useful on imported memory: every submission marks
+  the whole heap written.
+
+Bandwidth for the GPU, 256 MB, GB/s:
+
+| Memory | seq read | scattered read | seq write | scattered write |
+|---|---:|---:|---:|---:|
+| Imported `VirtualAlloc` / CUSTOM WRITE_BACK L0 (system memory) | 2.3 | 0.8 | 4.5–7.9 | 0.8 |
+| VRAM (DEFAULT, or GPU_UPLOAD) | 108 | 27 | 79 | 24 |
+
+CPU access: imported memory and CUSTOM heaps run at full speed (~15 GB/s).
+**GPU_UPLOAD** (VRAM the CPU maps; Resizable BAR is on here) writes at 22 GB/s
+but reads at **20 MB/s**.
+
+Consequences:
+- **GPU-only data belongs in VRAM**: what the GPU writes and the CPU never
+  reads (render targets already; most UAV-written buffers). It should stop
+  being copied back at all.
+- **CPU-written, GPU-read data can be shared without copies**, but only
+  through memory VIctory allocates:
+  - private `VirtualAlloc`, imported;
+  - or a CPU-visible arena, as upstream #407 proposes;
+  - or GPU_UPLOAD, only for memory the title never reads back.
+
+  xmem's section-backed physical pages cannot be imported under Wine, so
+  they would have to move to such an arena.
+- **System memory is 30–45× slower for the GPU than VRAM.** In-place
+  access suits data written each frame and read once. Hot buffers still
+  want VRAM.
