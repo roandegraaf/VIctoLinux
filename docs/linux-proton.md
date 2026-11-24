@@ -103,6 +103,9 @@ instead of dropped; `VICTORY_PS_FALLBACK=0` turns that off.
 `VICTORY_PIPELINE_WAIT_MS` sets how long a frame may wait for pipelines
 being made (500 by default; 0 never waits, pipelines then appear a few
 frames later).
+`VICTORY_COPY_HOLES=0` stops the copies of title memory from remembering
+unmapped 64 KiB blocks (they are then read, failing, at every refresh, as
+before; for comparing).
 
 ## Tests
 

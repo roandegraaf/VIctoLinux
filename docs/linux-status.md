@@ -168,6 +168,25 @@ The order instead:
 
 Re-measure after each change with the statistics lines above.
 
+Done since, not yet measured in the world:
+
+- **The timers of step 2 exist.** The diagnostics build logs a second
+  line, "copy path per frame", next to "copies per frame": title copies
+  and fills apart, the time of all merged refreshes, failed reads and the
+  time in the fallback walk, `texture::committed` and `watch::writing` on
+  title destinations, allocation lookups, write-watch askings answered
+  from the journal, and the holes below.
+- **The copy time was counted twice in part.** A copy into title memory
+  first does the refreshes waiting before it; their time went into "copies"
+  once on their own and once more with the copy. The 2.9 s above includes
+  that.
+- **Unmapped blocks are remembered** (`watch::HOLES`, off with
+  `VICTORY_COPY_HOLES=0`). A 64 KiB block with nothing mapped used to be
+  reported written at every refresh of view memory (it cannot be guarded).
+  The copy then read its run whole, failing, then block by block, then the
+  hole in 16 pieces, failing. Now a known hole costs one one-byte read per
+  use, which also notices memory mapped there since.
+
 ## Unified memory: can the GPU use title memory in place? (probe, 2026-11-24)
 
 The Xbox shares one memory pool between CPU and GPU. VIctory instead keeps
