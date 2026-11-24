@@ -153,6 +153,22 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    // The GPU side looks allocations up at every copy; told of ours, it
+    // need not ask the host (slow and contended under Wine).
+    if !at.is_null() && kind & MEM_RESERVE != 0 && kind & MEM_REPLACE_PLACEHOLDER == 0 {
+        use victory_gpu::TitleMemory;
+        let memory = if kind & MEM_RESERVE_PLACEHOLDER != 0 {
+            TitleMemory::Views
+        } else if kind & MEM_WRITE_WATCH != 0 {
+            TitleMemory::Watched
+        } else {
+            TitleMemory::Plain
+        };
+        // As the host rounds: the end up to its 4 KiB pages.
+        let from = if base.is_null() { at } else { base } as usize;
+        let end = from.saturating_add(size).saturating_add(4095) & !4095;
+        victory_gpu::title_memory_allocated(at as usize, end - at as usize, memory);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -318,6 +334,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::title_memory_freed(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -726,8 +743,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    // New contents, read-write: the GPU side's copies no longer guard it,
+    // and it knows a view is here without asking the host.
+    victory_gpu::title_view_mapped(base, len);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -806,7 +824,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        victory_gpu::title_memory_remapped(at, size);
+        victory_gpu::title_view_unmapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1151,6 +1169,77 @@ mod tests {
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// The GPU side is told what we allocate, map and unmap, so that it
+    /// need not ask the host.
+    #[test]
+    fn the_gpu_side_is_told_of_allocations_and_views() {
+        use victory_gpu::{TitleMemory, title_memory_record as record};
+        // A pool: write-watched, its odd size rounded as the host does.
+        let pool = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * MIB + 100,
+            MEM_RESERVE,
+            GRAPHICS,
+            PAGE_READWRITE,
+        ) as usize;
+        assert_ne!(pool, 0);
+        let whole = Some((pool, 4 * MIB + 4096, Some(TitleMemory::Watched)));
+        assert_eq!(record(pool), whole);
+        assert_eq!(record(pool + 4 * MIB + 4095), whole);
+        // Committing part of it is no new allocation.
+        let part = XMemVirtualAlloc(
+            (pool + MIB) as *mut c_void,
+            PAGE,
+            MEM_COMMIT,
+            GRAPHICS,
+            PAGE_READWRITE,
+        );
+        assert_eq!(part as usize, pool + MIB);
+        assert_eq!(record(pool + MIB), whole);
+        // SAFETY: our own reservation.
+        assert_ne!(unsafe { VirtualFree(pool as *mut c_void, 0, MEM_RELEASE) }, 0);
+
+        // 32-bit memory, freed through us.
+        let small = XMemAlloc(4096, ALLOC_32BIT) as usize;
+        assert_eq!(record(small), Some((small, 4096, Some(TitleMemory::Watched))));
+        XMemFree(small as *mut c_void, ALLOC_32BIT);
+        assert_eq!(record(small), None);
+
+        // A reservation of 64 KiB pages and the views in it.
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        let at = |page: usize| a as usize + page * PAGE;
+        let gap = Some((at(0), 4 * PAGE, Some(TitleMemory::Views)));
+        assert_eq!(record(at(2)), gap);
+        let first = at(1) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(first, 3, pages.as_ptr()), first);
+        assert_eq!(record(at(0)), gap);
+        for page in 1..4 {
+            assert_eq!(record(at(page) + 100), Some((at(1), 3 * PAGE, None)));
+        }
+        // Unmapping the middle page leaves a view on each side.
+        let middle = at(2) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        assert_eq!(record(at(1)), Some((at(1), PAGE, None)));
+        assert_eq!(record(at(2)), gap);
+        assert_eq!(record(at(3)), Some((at(3), PAGE, None)));
+        // The GPU's page-mapping copy makes a view too.
+        assert!(map_alias(at(0) as u64, at(3) as u64, PAGE as u64));
+        assert_eq!(record(at(0)), Some((at(0), PAGE, None)));
+        assert!(map_alias(at(0) as u64, 0, PAGE as u64));
+        assert_eq!(XMemMapPhysicalPages(first, 3, std::ptr::null()), first);
+        for page in 0..4 {
+            assert_eq!(record(at(page)), gap);
+        }
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
