@@ -206,27 +206,8 @@ impl Shadow {
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
+                if let Some(bytes) = self.merge(at, &before[at - from..at - from + n], &mut title[..n]) {
+                    written += bytes;
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
@@ -257,6 +238,37 @@ impl Shadow {
             give_back(bytes);
         }
         written
+    }
+
+    /// One piece of [`Shadow::copy_back`]: the copy from offset `at` on,
+    /// compared with `old`, its bytes before the submission. Where they
+    /// differ title memory (read into `title`, of `old`'s length) gets the
+    /// GPU's bytes, and the copy takes the title's in turn. Returns the
+    /// bytes written to title memory, or `None` if the GPU wrote nothing
+    /// there or the title's memory cannot be read.
+    fn merge(&self, at: usize, old: &[u8], title: &mut [u8]) -> Option<usize> {
+        let (start, n) = (self.start as usize, old.len());
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        if host == old || !crate::host::read_into((start + at) as *const u8, title) {
+            return None;
+        }
+        // Title memory with the GPU's bytes put in; the copy takes the
+        // title's bytes in turn.
+        let mut changed = false;
+        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+            if *h != *o && *t != *h {
+                *t = *h;
+                changed = true;
+            }
+            *h = *t;
+        }
+        if !changed {
+            return Some(0);
+        }
+        crate::watch::writing(start + at, n);
+        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        Some(n)
     }
 
     /// At submission: copies what changed of `[address, address + len)`
