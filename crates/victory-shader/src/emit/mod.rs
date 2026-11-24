@@ -588,6 +588,16 @@ mod tests {
             v.validate(&mut vs.dxil.clone()).unwrap();
         }
         host.pipeline(&vs, &ps).unwrap();
+        // vkd3d-proton (Wine, Proton) does not check the container hash.
+        // SAFETY: plain lookups in ntdll, always loaded.
+        let wine = unsafe {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        };
+        if wine {
+            return;
+        }
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)
