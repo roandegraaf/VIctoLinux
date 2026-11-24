@@ -21,7 +21,9 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on one machine: Windows 11, AMD RX 6700 XT; and on Linux under
+Proton Experimental: CachyOS, AMD RX 9070 XT (see
+[docs/linux-proton.md](docs/linux-proton.md)).
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -87,24 +89,30 @@ title's window has focus:
 
 ## Working on Linux
 
-The title runs on Windows only, but most crates build and test elsewhere.
-On Linux (the `linux` CI job runs the same):
+Every crate builds, lints and tests on Linux; tests that need a Windows
+host or GPU (the shader execution tests, DXIL validation, the loader's
+prepare tests) are compiled out there:
 
 ```sh
-cargo test -p victory-core -p victory-pe -p victory-formats -p victory-shader \
-  -p victory-pipeline -p victory-game -p xtask -p victory-gpu -p victory-hle
+cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Tests that need a Windows host or GPU (the shader execution tests, DXIL
-validation, the loader) are left out there. The Windows code can still be
-checked from Linux; with LLVM's `clang-cl` and `llvm-lib` for the C parts
-of dependencies:
+The Windows code can still be checked from Linux; with LLVM's `clang-cl` and
+`llvm-lib` for the C parts of dependencies:
 
 ```sh
 rustup target add x86_64-pc-windows-msvc   # already in rust-toolchain.toml
 CC_x86_64_pc_windows_msvc=clang-cl AR_x86_64_pc_windows_msvc=llvm-lib \
   cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```
+
+### Linux (Proton)
+
+VIctory also runs on Linux under Proton Experimental, built with
+`cargo-xwin`, and gets as far there as on Windows: see
+[docs/linux-proton.md](docs/linux-proton.md) and `scripts/proton-run.sh`.
 
 ## Commands
 
