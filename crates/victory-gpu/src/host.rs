@@ -73,6 +73,12 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// For tests: the bytes copied back so far.
+#[cfg(test)]
+pub(crate) fn copied_back() -> u64 {
+    COPY_BACK[1].load(Ordering::Relaxed)
+}
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -512,6 +518,7 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        crate::owned::new_submission();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
@@ -607,9 +614,21 @@ impl Host {
                 }
             }
         }
+        // Title memory this submission writes otherwise than through the
+        // copy at hand: no block of it becomes the GPU's (`crate::owned`).
+        let mut foreign: Vec<(usize, usize, usize)> = Vec::new();
+        if crate::owned::enabled() {
+            foreign.extend(back.iter().map(|(s, a, l)| (std::sync::Arc::as_ptr(s) as usize, *a, a + l)));
+            for list in runs {
+                foreign.extend(list.deferred().writes.iter().map(|&(at, _, bytes)| (0, at, at + bytes)));
+            }
+        }
         for (shadow, address, len) in &back {
             let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+            let me = std::sync::Arc::as_ptr(shadow) as usize;
+            let others: Vec<(usize, usize)> =
+                foreign.iter().filter(|f| f.0 != me).map(|&(_, a, e)| (a, e)).collect();
+            let written = shadow.copy_back(address, len, &others);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1321,7 +1340,6 @@ impl Batch {
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     use crate::copystat::{C, add};
-    use crate::watch::PAGE;
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -1344,6 +1362,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         if !committed {
             return;
         }
+        // Nor GPU-owned: the kernel's write would fail there.
+        crate::owned::release(dst as usize, len);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // The kernel writes the destination: it must not be guarded.
@@ -1351,7 +1371,30 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         #[cfg(feature = "diagnostics")]
         add(C::WritingUs, started.elapsed().as_micros() as u64);
     }
-    let (start, end) = (src as usize, src as usize + len);
+    let (first, last) = (src as usize, src as usize + len);
+    // What the GPU owns of the source is read from its owner's copy (the
+    // kernel's read of it would fail, and be taken for unmapped memory);
+    // the rest around it, each part as below.
+    let served = crate::owned::serve(first, len, dst, title_dst);
+    if !served.is_empty() {
+        let mut at = first;
+        for (from, to) in served.into_iter().chain([(last, last)]) {
+            if at < from {
+                copy_mapped_part(dst.wrapping_add(at - first), at, from);
+            }
+            at = to;
+        }
+        return;
+    }
+    copy_mapped_part(dst, first, last);
+}
+
+/// [`copy_mapped`] of title memory `[start, end)` no block of which the GPU
+/// owns, to `dst`.
+fn copy_mapped_part(dst: *mut u8, start: usize, end: usize) {
+    #[cfg(feature = "diagnostics")]
+    use crate::copystat::{C, add};
+    use crate::watch::PAGE;
     // `[from, to)` of the source in one read, piece by piece if it fails.
     let run = |from: usize, to: usize| {
         let into = dst.wrapping_add(from - start);
@@ -1436,6 +1479,7 @@ fn walk(dst: *mut u8, src: usize, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    crate::owned::release(src as usize, dst.len());
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -1491,6 +1535,7 @@ thread_local! {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    crate::owned::release(dst as usize, len);
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;

@@ -147,7 +147,7 @@ fn make() -> windows::core::Result<Clamp> {
 
 /// Constants b0 (four words: kind, stride, records, unused), then the
 /// arguments as root UAV u0 and the budget as root UAV u1.
-fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+pub(crate) fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
     let uav = |register| D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
         Anonymous: D3D12_ROOT_PARAMETER_0 {

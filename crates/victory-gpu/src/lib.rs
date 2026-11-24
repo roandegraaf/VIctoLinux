@@ -43,6 +43,8 @@ mod indirect;
 mod inplace_probe;
 pub mod list;
 pub mod object;
+#[cfg(windows)]
+mod owned;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
@@ -64,8 +66,56 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
 #[cfg(windows)]
 pub use watch::{
     TitleMemory, title_memory_allocated, title_memory_freed, title_memory_record,
-    title_memory_remapped, title_view_mapped, title_view_unmapped, writing as kernel_will_write,
+    title_view_mapped, title_view_unmapped,
 };
+
+/// Before the kernel writes title memory `[at, at + len)` for the title (a
+/// file read into it): the kernel does not fault into our handlers, so
+/// blocks the GPU owns go back to the title and guarded ones are opened.
+#[cfg(windows)]
+pub fn kernel_will_write(at: usize, len: usize) {
+    owned::release(at, len);
+    watch::writing(at, len);
+}
+
+/// Before the kernel reads title memory `[at, at + len)` for the title, or
+/// the title changes how it is committed or protected: blocks the GPU owns
+/// go back to the title.
+#[cfg(windows)]
+pub fn title_will_touch(at: usize, len: usize) {
+    owned::release(at, len);
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`, or the
+/// title decommitted it: see [`watch::title_memory_remapped`]; blocks the
+/// GPU owned there are dropped.
+#[cfg(windows)]
+pub fn title_memory_remapped(at: usize, len: usize) {
+    owned::forget(at, len);
+    watch::title_memory_remapped(at, len);
+}
+
+/// The title decommits `[at, at + len)`: blocks the GPU owned there are
+/// dropped (what the title frees needs no bytes back).
+#[cfg(windows)]
+pub fn title_memory_decommitted(at: usize, len: usize) {
+    owned::forget(at, len);
+}
+
+/// The title releases the allocation at `base` whole.
+#[cfg(windows)]
+pub fn title_memory_released(base: usize) {
+    owned::forget_allocation(base);
+}
+
+/// Whether GPU-written title memory stays with the GPU until the title
+/// touches it (`VICTORY_LAZY_COPY_BACK=1`): the runtime then tells us of the
+/// title's own memory calls.
+#[cfg(windows)]
+pub fn lazy_copy_back() -> bool {
+    owned::enabled()
+}

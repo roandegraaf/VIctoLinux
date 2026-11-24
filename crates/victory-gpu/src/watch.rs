@@ -318,6 +318,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some((now, out))
 }
 
+/// The journal's last writes of pages `[first, last)`, in page order,
+/// without asking the kernel: what [`writes`] has reported so far (for
+/// [`crate::owned`], which asks the kernel itself and resets nothing).
+pub(crate) fn last_writes(first: usize, last: usize) -> Vec<(usize, u64)> {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 

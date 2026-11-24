@@ -175,6 +175,7 @@ pub(crate) fn resync_title_writes() {
         };
         let page = crate::watch::PAGE as u64;
         let (first, last) = (start / page * page, end.div_ceil(page) * page);
+        crate::owned::release(first as usize, (last - first) as usize);
         let Some((now, written)) = crate::watch::writes(first as usize, last as usize, true) else {
             continue;
         };

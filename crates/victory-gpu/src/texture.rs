@@ -187,6 +187,8 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
+        // What shaders wrote into GPU-owned blocks here shows in no watch.
+        crate::owned::release(start, size);
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
