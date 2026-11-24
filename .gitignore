@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# vkd3d-proton pipeline caches written by tests run under Wine
+vkd3d-proton.cache*

@@ -34,19 +34,34 @@ The diagnostics build likewise:
 
 ## Running
 
-`scripts/proton-run.sh` runs `victory.exe` with Proton's Wine, in a prefix of
-its own (`~/.local/share/victory/proton`, made on first use), with
-vkd3d-proton and DXVK. Linux paths work as arguments.
+`scripts/run-proton.sh` runs `victory.exe` under a chosen Proton or Wine
+build (`--proton` / `PROTON`, default Proton Experimental), in a prefix of
+its own per build (`~/.local/share/victory/prefixes/`). It fetches GE-Proton's
+vkd3d-proton and DXVK `dxgi.dll` once into `~/.cache/victory/runtime/`
+(`--ge-tag`, default GE-Proton11-14, whose vkd3d-proton 3.2 build `cae8353ed`
+carries the dxil-spirv fix), checks the release checksum, copies them into the
+prefix and sets `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi=n;d3dcompiler_47=b"`.
+`--dlls proton` uses the Proton build's own instead. Linux paths work as
+arguments; logs go to `~/.local/state/victory/logs/`.
 
 ```sh
-scripts/proton-run.sh config
-scripts/proton-run.sh run /path/to/game/<the title's exe> --execute
+scripts/run-proton.sh fetch                          # the DLLs only
+scripts/run-proton.sh -- config
+scripts/run-proton.sh /path/to/game/<the title's exe>             # binding report
+scripts/run-proton.sh --diag --timeout 900 --mem-max 20G \
+    /path/to/game/<the title's exe> --execute
 ```
 
-`PROTON` selects another Proton folder, `PREFIX` another prefix and
-`VICTORY_EXE` another exe (the diagnostics build, say). Saves, settings and
-`crashes.log` live in the prefix's `%LOCALAPPDATA%\victory\data` unless
-`victory.toml` or `VICTORY_DATA_DIR` says otherwise.
+`GAME_EXE` can stand in for the exe argument, `VICTORY_EXE` / `--exe` picks
+another victory.exe, and `VICTORY_KEYS` and the other `VICTORY_*` switches pass
+through. `VICTORY_NO_WATCHDOG` is set to 1 (only effective with #454). The
+script warns when there is no default audio sink: without one the title stops
+about 15 s in (#834). `scripts/proton-run.sh` is the same script under its
+older name.
+
+Saves, settings and `crashes.log` live where `victory.toml` (read from
+`~/.config/victory/victory.toml` when present) or `VICTORY_DATA_DIR` puts them,
+else in the prefix's `%LOCALAPPDATA%\victory\data`.
 
 With an Xbox controller connected, the keyboard is not a pad (as on
 Windows), so `VICTORY_KEYS` presses do not reach the title either.
@@ -90,7 +105,7 @@ frames later).
 ## Tests
 
 ```sh
-CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=$PWD/scripts/proton-run.sh \
+CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=$PWD/scripts/run-proton.sh \
     cargo xwin test --workspace --target x86_64-pc-windows-msvc
 ```
 

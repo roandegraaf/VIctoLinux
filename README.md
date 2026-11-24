@@ -112,7 +112,7 @@ CC_x86_64_pc_windows_msvc=clang-cl AR_x86_64_pc_windows_msvc=llvm-lib \
 
 VIctory also runs on Linux under Proton Experimental, built with
 `cargo-xwin`, and gets as far there as on Windows: see
-[docs/linux-proton.md](docs/linux-proton.md) and `scripts/proton-run.sh`.
+[docs/linux-proton.md](docs/linux-proton.md) and `scripts/run-proton.sh`.
 
 ## Commands
 
