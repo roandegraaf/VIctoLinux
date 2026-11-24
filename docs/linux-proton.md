@@ -54,7 +54,9 @@ scripts/run-proton.sh --diag --timeout 900 --mem-max 20G \
 
 `GAME_EXE` can stand in for the exe argument, `VICTORY_EXE` / `--exe` picks
 another victory.exe, and `VICTORY_KEYS` and the other `VICTORY_*` switches pass
-through. `VICTORY_NO_WATCHDOG` is set to 1 (only effective with #454). The
+through. `--auto-enter` presses Enter (the pad's A) every 4 s from 15 s to
+150 s after input starts, which gets through the first-boot and start screens
+unattended; it uses the diagnostics build. `VICTORY_NO_WATCHDOG` is set to 1 (only effective with #454). The
 script warns when there is no default audio sink: without one the title stops
 about 15 s in (#834). `scripts/proton-run.sh` is the same script under its
 older name.

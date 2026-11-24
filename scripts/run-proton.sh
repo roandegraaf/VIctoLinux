@@ -29,6 +29,11 @@
 #   --timeout SECONDS       TIMEOUT      end the run after this long
 #   --mem-max SIZE          MEM_MAX      memory cap (systemd-run MemoryMax, e.g. 20G)
 #   --prefix DIR            PREFIX       Wine prefix (default: one per Proton build)
+#   --auto-enter [F:T:S]    AUTO_ENTER   press Enter (the pad's A) every S seconds from
+#                                        F to T seconds after input starts, to get
+#                                        through the first-boot and start screens
+#                                        unattended (default 15:150:4; implies --diag,
+#                                        whose VICTORY_KEYS does the pressing)
 #
 # Also read: VICTORY_KEYS, VICTORY_LOG and the other VICTORY_* switches are
 # passed through. VICTORY_NO_WATCHDOG defaults to 1 (it only has an effect
@@ -48,6 +53,7 @@ D3DCOMPILER="${D3DCOMPILER:-b}"
 TIMEOUT="${TIMEOUT:-}"
 MEM_MAX="${MEM_MAX:-}"
 PREFIX="${PREFIX:-}"
+AUTO_ENTER="${AUTO_ENTER:-}"
 diag=0
 
 die() { echo "run-proton: $*" >&2; exit 1; }
@@ -66,6 +72,9 @@ while (($#)); do
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --mem-max) MEM_MAX="$2"; shift 2 ;;
         --prefix) PREFIX="$2"; shift 2 ;;
+        --auto-enter)
+            if [[ "${2:-}" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]]; then AUTO_ENTER="$2"; shift 2
+            else AUTO_ENTER=15:150:4; shift; fi ;;
         --) shift; args+=("$@"); break ;;
         *) args+=("$1"); shift ;;
     esac
@@ -181,6 +190,14 @@ if [[ "${args[0]:-}" == *.exe && "$(realpath -m "${args[0]}")" == "$ROOT/target/
     exec "$wine" "${args[@]}"
 fi
 
+if [[ -n "$AUTO_ENTER" ]]; then
+    diag=1
+    IFS=: read -r from to step <<<"$AUTO_ENTER"
+    keys=""
+    for ((t = from; t <= to; t += step)); do keys+="${keys:+,}$t:Enter"; done
+    export VICTORY_KEYS="${VICTORY_KEYS:+$VICTORY_KEYS,}$keys"
+    note "pressing Enter every ${step}s from ${from}s to ${to}s"
+fi
 if [[ -z "$VICTORY_EXE" ]]; then
     profile=release; ((diag)) && profile=diag
     VICTORY_EXE="$ROOT/target/x86_64-pc-windows-msvc/$profile/victory.exe"
