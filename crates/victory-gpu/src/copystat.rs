@@ -62,8 +62,8 @@ pub(crate) enum C {
     UpdateUs,
     /// Known holes: blocks zero-filled without a failing walk, blocks the
     /// guard no longer reports written, the one-byte reads that re-checked
-    /// them and their time, blocks newly found, and blocks found mapped
-    /// again.
+    /// them and their time (the guard's are in `WatchUs` as well), blocks
+    /// newly found, and blocks found mapped again.
     HolesFilled,
     HolesQuiet,
     HoleProbes,
@@ -163,8 +163,11 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexChanged as usize]),
     );
     // Where the copy time goes. Moves (above; the reads of whole runs), the
-    // walks, the probes, committed and opening guards do not overlap, and
-    // are all inside the refreshes, copies and fills.
+    // walks, committed and opening guards do not overlap, and are all
+    // inside the refreshes, copies and fills. The probes a copy makes are
+    // apart too; those the guard makes are also in the watches' time
+    // above, with its protecting. Zero-filling holes is in no time but the
+    // refreshes'.
     tracing::info!(
         "copy path per frame: {:.0} title copies {:.1} MB, {:.0} fills {:.1} MB; {:.0} merged \
          refreshes {:.2} ms; {:.0} failed reads, fallback walks {:.2} ms; title destinations: \

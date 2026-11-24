@@ -944,9 +944,6 @@ mod tests {
     /// finds them by its walk, once.
     #[test]
     fn a_failed_walk_finds_the_holes() {
-        if !holes_wanted() {
-            return;
-        }
         let pages = Pages::new(8);
         for block in [0, 2, 3, 6] {
             pages.map(block, block as u8 + 1, true);
@@ -956,10 +953,18 @@ mod tests {
         reads();
         crate::host::copy_mapped(copy.as_mut_ptr(), pages.base as *const u8, range, false);
         assert_eq!(blocks_of(&copy), [1, 0, 3, 4, 0, 0, 7, 0]);
-        assert_eq!(pages.holes(), [1, 4, 5, 7]);
         // The whole read, then each hole whole and in its 16 pages.
         assert_eq!(reads(), (1 + 4 * 17, 0));
         copy.fill(0xaa);
+        if !holes_wanted() {
+            // `VICTORY_COPY_HOLES=0`: the same again, every time.
+            crate::host::copy_mapped(copy.as_mut_ptr(), pages.base as *const u8, range, false);
+            assert_eq!(blocks_of(&copy), [1, 0, 3, 4, 0, 0, 7, 0]);
+            assert_eq!(reads(), (1 + 4 * 17, 0));
+            assert_eq!(pages.holes(), []);
+            return;
+        }
+        assert_eq!(pages.holes(), [1, 4, 5, 7]);
         crate::host::copy_mapped(copy.as_mut_ptr(), pages.base as *const u8, range, false);
         assert_eq!(blocks_of(&copy), [1, 0, 3, 4, 0, 0, 7, 0]);
         assert_eq!(reads(), (0, 4));
