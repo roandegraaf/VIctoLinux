@@ -241,3 +241,33 @@ Consequences:
 - **System memory is 30–45× slower for the GPU than VRAM.** In-place
   access suits data written each frame and read once. Hot buffers still
   want VRAM.
+
+## Holes cache: measured (2026-11-24)
+
+The holes cache (`VICTORY_COPY_HOLES`, on by default) remembers 64 KiB title
+blocks with nothing mapped. It stops copying them and stops reporting them
+written. Two runs on the same build, same setup as above, 7 minutes each,
+`--auto-enter`. Means over the world's statistics lines, first four after
+loading skipped:
+
+| Per frame | `VICTORY_COPY_HOLES=0` | default (cache on) |
+|---|---:|---:|
+| Whole frame (median) | 6,054 ms (5,333) | **3,711 ms (3,100)** |
+| Copies | 4,546 ms, 245 MB | **1,181 ms**, 40 MB |
+| Failed `ReadProcessMemory` / fallback walk | 28,578 / 2,626 ms | **0 / 0 ms** |
+| Merged refreshes | 1,731, 3,114 ms | 1,306, 346 ms |
+| Allocation lookups (`VirtualQuery` walks) | 788 ms | 407 ms |
+| Hole probes | – | 859, 74 ms |
+| GPU | 180 ms | 126 ms |
+| Everything else (title CPU, waits) | 440 ms | 1,149 ms |
+
+The copies fell by three quarters, and the unmapped-page walk was nearly
+all of what they cost. The whole frame fell less: in the run with the cache
+on, "everything else" grew. That part is untimed by VIctory. It is either
+the cutscene reaching a heavier part in the same 7 minutes, or the title's
+own CPU work now being visible. These are single runs, so the split is
+indicative.
+
+The next copy-path cost is `allocation()`: about 400 ms per frame of
+`VirtualQuery` walks, which take Wine's virtual-memory lock. Stage 3 answers
+them from xmem's own records.
