@@ -27,6 +27,8 @@ pub mod media;
 #[cfg(windows)]
 pub mod net;
 pub mod speech;
+#[cfg(windows)]
+pub mod vmem;
 pub mod storage;
 pub mod xasync;
 pub mod xg;
@@ -71,5 +73,11 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // The title's own memory calls, only when the GPU side owns title
+    // memory (`VICTORY_LAZY_COPY_BACK=1`).
+    #[cfg(windows)]
+    if victory_gpu::lazy_copy_back() {
+        all.push(vmem::module());
+    }
     all
 }

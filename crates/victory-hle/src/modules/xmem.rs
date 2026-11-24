@@ -127,6 +127,11 @@ pub extern "system" fn XMemVirtualAlloc(
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
     // Address requirements apply to reservations at an address of our choice.
     let constrained = base.is_null();
+    if !constrained {
+        // Committing over blocks the GPU side owns would open them
+        // without their bytes.
+        victory_gpu::title_will_touch(base as usize, size);
+    }
     if constrained {
         kind |= MEM_RESERVE;
         // The GPU side copies only the pages the title wrote since its last
@@ -335,6 +340,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
             victory_gpu::title_memory_freed(address as usize);
+            victory_gpu::title_memory_released(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
