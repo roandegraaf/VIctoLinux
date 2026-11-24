@@ -271,3 +271,29 @@ indicative.
 The next copy-path cost is `allocation()`: about 400 ms per frame of
 `VirtualQuery` walks, which take Wine's virtual-memory lock. Stage 3 answers
 them from xmem's own records.
+
+## Allocation lookups from xmem's records (not yet measured in the world)
+
+`watch::allocation()` asked the host which allocation an address is in: one
+`VirtualQuery` per region of the allocation, up to 256, and every map or
+unmap of physical pages emptied the cache of answers. Now:
+
+- **xmem tells the GPU side what it allocates** (`watch/records.rs`): each
+  reservation with its size and kind (write-watched, a placeholder for
+  views, or neither), and each view as it is mapped and unmapped. Lookups
+  inside those are answered from the records with no `VirtualQuery`.
+- **Only memory xmem did not allocate is still walked** (the title's own
+  `VirtualAlloc`, which kernel32 passes through). Those answers are cached
+  as before.
+- **A remap drops only the cached answers it overlaps**, not all of them.
+- The title frees xmem's reservations with the host's `VirtualFree`, unseen.
+  A record left behind is dropped when the host refuses the write-watch
+  asking it leads to, as a stale cache entry was.
+
+One answer differs from the walk's. A watched reservation of at most 4 GiB
+with more than 256 regions used to be asked about piece by piece. It is now
+asked about whole, once per submission. If "watches … ms" grows in the
+statistics line, this is why.
+
+The "copy path per frame" line shows the split: "N allocation lookups (R
+from records, W walked)". The rest were walked before and remembered.
